@@ -1,16 +1,19 @@
 extern crate notify;
 
 use futures::{stream, Stream};
-use notify::{
-    DebouncedEvent, Error as NotifyError, RecommendedWatcher, RecursiveMode,
-    Watcher as NotifyWatcher,
-};
+use notify::{DebouncedEvent, Error as NotifyError, RecursiveMode, Watcher as NotifyWatcher};
 use std::io;
 use std::path::Path;
-use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
 type PathId = std::path::PathBuf;
+
+#[cfg(target_os = "linux")]
+type OsWatcher = notify::INotifyWatcher;
+#[cfg(target_os = "windows")]
+type OsWatcher = notify::ReadDirectoryChangesWatcher;
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+type OsWatcher = notify::PollWatcher;
 
 #[derive(Debug)]
 /// Event wrapper to that hides platform and implementation details.
@@ -86,15 +89,22 @@ pub enum Error {
 }
 
 pub struct Watcher {
-    watcher: RecommendedWatcher,
-    rx: Receiver<DebouncedEvent>,
+    watcher: OsWatcher,
+    rx: async_channel::Receiver<DebouncedEvent>,
 }
 
 impl Watcher {
-    pub fn new() -> Self {
-        let (tx, rx) = channel();
+    pub fn new(delay: Duration) -> Self {
+        let (watcher_tx, blocking_rx) = std::sync::mpsc::channel();
 
-        let watcher = NotifyWatcher::new(tx, Duration::from_secs(1)).unwrap();
+        let watcher = OsWatcher::new(watcher_tx, delay).unwrap();
+        let (async_tx, rx) = async_channel::unbounded();
+        tokio::task::spawn_blocking(move || {
+            while let Ok(event) = blocking_rx.recv() {
+                async_tx.try_send(event).expect("channel can not be closed");
+            }
+        });
+
         Self { watcher, rx }
     }
 
@@ -113,30 +123,22 @@ impl Watcher {
     pub fn receive(&self) -> impl Stream<Item = Event> + '_ {
         stream::unfold(&self.rx, |rx| async move {
             loop {
-                match rx.recv() {
-                    Ok(event) => {
-                        if let Some(mapped_event) = match event {
-                            DebouncedEvent::NoticeWrite(p) => Some(Event::NoticeWrite(p)),
-                            DebouncedEvent::NoticeRemove(p) => Some(Event::NoticeRemove(p)),
-                            DebouncedEvent::Create(p) => Some(Event::Create(p)),
-                            DebouncedEvent::Write(p) => Some(Event::Write(p)),
-                            DebouncedEvent::Chmod(_) => {
-                                // Ignore attribute changes
-                                None
-                            }
-                            DebouncedEvent::Remove(p) => Some(Event::Remove(p)),
-                            DebouncedEvent::Rename(source, dest) => {
-                                Some(Event::Rename(source, dest))
-                            }
-                            DebouncedEvent::Rescan => Some(Event::Rescan),
-                            DebouncedEvent::Error(_, p) => Some(Event::Error(p)),
-                        } {
-                            return Some((mapped_event, rx));
-                        }
+                let received = rx.recv().await.expect("channel can not be closed");
+                if let Some(mapped_event) = match received {
+                    DebouncedEvent::NoticeWrite(p) => Some(Event::NoticeWrite(p)),
+                    DebouncedEvent::NoticeRemove(p) => Some(Event::NoticeRemove(p)),
+                    DebouncedEvent::Create(p) => Some(Event::Create(p)),
+                    DebouncedEvent::Write(p) => Some(Event::Write(p)),
+                    DebouncedEvent::Chmod(_) => {
+                        // Ignore attribute changes
+                        None
                     }
-                    Err(_) => {
-                        return Some((Event::Error(None), rx));
-                    }
+                    DebouncedEvent::Remove(p) => Some(Event::Remove(p)),
+                    DebouncedEvent::Rename(source, dest) => Some(Event::Rename(source, dest)),
+                    DebouncedEvent::Rescan => Some(Event::Rescan),
+                    DebouncedEvent::Error(_, p) => Some(Event::Error(p)),
+                } {
+                    return Some((mapped_event, rx));
                 }
             }
         })
@@ -146,25 +148,99 @@ impl Watcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use futures::StreamExt;
+    use pin_utils::pin_mut;
     use std::fs::File;
+    use std::io::{self, Write};
     use tempfile::tempdir;
 
-    #[tokio::test]
-    async fn test_watch_file() {
-        let dir = tempdir().unwrap();
-        let dir_path = dir.path();
+    static DELAY: Duration = Duration::from_millis(200);
 
-        let mut w = Watcher::new();
+    macro_rules! is_match {
+        ($p: expr, $e: ident, $expected_path: expr) => {
+            match $p {
+                Event::$e(path) => {
+                    assert_eq!(path.file_name(), $expected_path.file_name());
+                    assert_eq!(
+                        path.parent().unwrap().file_name(),
+                        $expected_path.parent().unwrap().file_name()
+                    );
+                }
+                _ => panic!("event didn't match Event::{}", stringify!($e)),
+            }
+        };
+    }
+    macro_rules! take {
+        ($stream: ident, $result: ident) => {
+            tokio::time::sleep(DELAY).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            loop {
+                tokio::select! {
+                    item = $stream.next() => {
+                        $result.push(item.unwrap());
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                        break;
+                    }
+                }
+            }
+        };
+    }
+
+    #[tokio::test]
+    async fn test_initial_write_get_debounced_into_create() -> io::Result<()> {
+        let dir = tempdir().unwrap().into_path();
+        let dir_path = &dir;
+
+        let mut w = Watcher::new(DELAY);
         w.add(dir_path).unwrap();
 
-        File::create(dir_path.join("insert.log")).unwrap();
-
-        let mut stream = w.receive();
-        let items =
-            futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::take(stream, 1)).await;
-        for event in items {
-            println!("{:?}", event);
+        let file1_path = dir_path.join("file1.log");
+        let mut file1 = File::create(&file1_path)?;
+        for i in 0..10 {
+            writeln!(file1, "SAMPLE {}", i)?;
         }
+
+        let stream = w.receive();
+        pin_mut!(stream);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut items = Vec::new();
+        take!(stream, items);
+        assert_eq!(items.len(), 1);
+        is_match!(&items[0], Create, file1_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_watch_file_write_after_create() -> io::Result<()> {
+        let dir = tempdir().unwrap().into_path();
+        let dir_path = &dir;
+
+        let mut w = Watcher::new(DELAY);
+        w.add(dir_path).unwrap();
+
+        let file1_path = dir_path.join("file1.log");
+        let mut file1 = File::create(&file1_path)?;
+
+        let stream = w.receive();
+        pin_mut!(stream);
+
+        let mut items = Vec::new();
+        take!(stream, items);
+
+        assert_eq!(items.len(), 1);
+        is_match!(&items[0], Create, file1_path);
+
+        for i in 10..20 {
+            writeln!(file1, "SAMPLE {}", i)?;
+        }
+
+        take!(stream, items);
+
+        is_match!(&items[1], NoticeWrite, file1_path);
+        is_match!(&items[2], Write, file1_path);
+        Ok(())
     }
 }

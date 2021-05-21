@@ -1695,8 +1695,10 @@ dependencies = [
 name = "notify_stream"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "futures",
  "notify",
+ "pin-utils",
  "tempfile",
  "tokio",
 ]
