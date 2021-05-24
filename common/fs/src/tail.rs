@@ -402,10 +402,9 @@ mod test {
                     Lookback::None,
                     None,
                 );
-                let mut buf = [0u8; 4096];
 
                 let stream = tailer
-                    .process(&mut buf)
+                    .process()
                     .expect("failed to read events")
                     .timeout(std::time::Duration::from_millis(500));
 
@@ -452,10 +451,9 @@ mod test {
                     Lookback::SmallFiles,
                     None,
                 );
-                let mut buf = [0u8; 4096];
 
                 let stream = tailer
-                    .process(&mut buf)
+                    .process()
                     .expect("failed to read events")
                     .timeout(std::time::Duration::from_millis(500));
 
@@ -504,10 +502,8 @@ mod test {
                     None,
                 );
 
-                let mut buf = [0u8; 4096];
-
                 let stream = tailer
-                    .process(&mut buf)
+                    .process()
                     .expect("failed to read events")
                     .timeout(std::time::Duration::from_millis(500));
 

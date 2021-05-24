@@ -5,6 +5,7 @@ use notify::{DebouncedEvent, Error as NotifyError, RecursiveMode, Watcher as Not
 use std::io;
 use std::path::Path;
 use std::time::Duration;
+use std::rc::Rc;
 
 type PathId = std::path::PathBuf;
 
@@ -90,7 +91,7 @@ pub enum Error {
 
 pub struct Watcher {
     watcher: OsWatcher,
-    rx: async_channel::Receiver<DebouncedEvent>,
+    rx: Rc<async_channel::Receiver<DebouncedEvent>>,
 }
 
 impl Watcher {
@@ -105,7 +106,7 @@ impl Watcher {
             }
         });
 
-        Self { watcher, rx }
+        Self { watcher, rx: Rc::new(rx) }
     }
 
     /// Adds a new directory or file to watch
@@ -120,8 +121,9 @@ impl Watcher {
         self.watcher.unwatch(path).map_err(|e| e.into())
     }
 
-    pub fn receive<'a>(&'a self) -> impl Stream<Item = Event> + 'a {
-        stream::unfold(&self.rx, |rx| async move {
+    pub fn receive(&self) -> impl Stream<Item = Event> {
+        let rx = Rc::clone(&self.rx);
+        stream::unfold(rx, |rx| async move {
             loop {
                 let received = rx.recv().await.expect("channel can not be closed");
                 if let Some(mapped_event) = match received {
