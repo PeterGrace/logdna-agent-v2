@@ -151,6 +151,7 @@ mod tests {
 
     use futures::StreamExt;
     use pin_utils::pin_mut;
+    use std::cell::RefCell;
     use std::fs::File;
     use std::io::{self, Write};
     use tempfile::tempdir;
@@ -171,6 +172,7 @@ mod tests {
             }
         };
     }
+
     macro_rules! take {
         ($stream: ident, $result: ident) => {
             tokio::time::sleep(DELAY).await;
@@ -188,6 +190,21 @@ mod tests {
         };
     }
 
+    macro_rules! append {
+        ($file: ident) => {
+            for i in 0..20 {
+                writeln!($file, "SAMPLE {}", i)?;
+            }
+        };
+    }
+
+    macro_rules! wait_and_append {
+        ($file: ident) => {
+            tokio::time::sleep(DELAY.clone().mul_f32(3.0)).await;
+            append!($file);
+        };
+    }
+
     #[tokio::test]
     async fn test_initial_write_get_debounced_into_create() -> io::Result<()> {
         let dir = tempdir().unwrap().into_path();
@@ -198,9 +215,7 @@ mod tests {
 
         let file1_path = dir_path.join("file1.log");
         let mut file1 = File::create(&file1_path)?;
-        for i in 0..10 {
-            writeln!(file1, "SAMPLE {}", i)?;
-        }
+        append!(file1);
 
         let stream = w.receive();
         pin_mut!(stream);
@@ -208,7 +223,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let mut items = Vec::new();
         take!(stream, items);
-        assert_eq!(items.len(), 1);
+        // Depending on timers, it will get debounced or not :(
+        assert!(!items.is_empty());
         is_match!(&items[0], Create, file1_path);
         Ok(())
     }
@@ -216,12 +232,11 @@ mod tests {
     #[tokio::test]
     async fn test_watch_file_write_after_create() -> io::Result<()> {
         let dir = tempdir().unwrap().into_path();
-        let dir_path = &dir;
 
         let mut w = Watcher::new(DELAY);
-        w.add(dir_path).unwrap();
+        w.add(&dir).unwrap();
 
-        let file1_path = dir_path.join("file1.log");
+        let file1_path = &dir.join("file1.log");
         let mut file1 = File::create(&file1_path)?;
 
         let stream = w.receive();
@@ -230,17 +245,77 @@ mod tests {
         let mut items = Vec::new();
         take!(stream, items);
 
-        assert_eq!(items.len(), 1);
+        assert!(!items.is_empty());
         is_match!(&items[0], Create, file1_path);
 
-        for i in 10..20 {
-            writeln!(file1, "SAMPLE {}", i)?;
-        }
-
+        wait_and_append!(file1);
         take!(stream, items);
 
         is_match!(&items[1], NoticeWrite, file1_path);
         is_match!(&items[2], Write, file1_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_watch_symlink_write_after_create() -> io::Result<()> {
+        let dir = tempdir().unwrap().into_path();
+        let excluded_dir = tempdir().unwrap().into_path();
+
+        let w = RefCell::new(Watcher::new(DELAY));
+        {
+            let mut w_mut = w.borrow_mut();
+            w_mut.add(&dir).unwrap();
+        }
+
+        let file_path = &excluded_dir.join("file1.log");
+        let symlink_path = &dir.join("symlink.log");
+        let mut file = File::create(&file_path)?;
+        std::os::unix::fs::symlink(&file_path, &symlink_path)?;
+
+        {
+            let w_ref = w.borrow();
+            let stream = w_ref.receive();
+            pin_mut!(stream);
+
+            let mut items = Vec::new();
+            take!(stream, items);
+
+            assert!(!items.is_empty());
+            is_match!(&items[0], Create, symlink_path);
+        }
+
+        {
+            let mut w_mut = w.borrow_mut();
+            w_mut.add(&file_path).unwrap();
+        }
+
+        wait_and_append!(file);
+
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        {
+            let w_ref = w.borrow();
+            let stream = w_ref.receive();
+            pin_mut!(stream);
+
+            let mut items = Vec::new();
+            take!(stream, items);
+
+            // macOS will produce events for both the symlink and the file
+            // linux will produce events for the real file manually added
+            let items: Vec<_> = items
+                .iter()
+                .filter(|e| match e {
+                    Event::NoticeWrite(p) => p.as_os_str() == file_path.as_os_str(),
+                    Event::Write(p) => p.as_os_str() == file_path.as_os_str(),
+                    _ => false,
+                })
+                .collect();
+
+            is_match!(&items[0], NoticeWrite, file_path);
+            is_match!(&items[1], Write, file_path);
+        }
         Ok(())
     }
 }
