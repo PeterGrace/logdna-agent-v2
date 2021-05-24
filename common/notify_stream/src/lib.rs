@@ -108,16 +108,16 @@ impl Watcher {
         Self { watcher, rx }
     }
 
-    /// Adds a new directory to watch
-    pub fn add<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
+    /// Adds a new directory or file to watch
+    pub fn watch<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
         self.watcher
             .watch(path, RecursiveMode::Recursive)
-            .map_err(|e| match e {
-                NotifyError::Generic(s) => Error::Generic(s),
-                NotifyError::Io(err) => Error::Io(err),
-                NotifyError::PathNotFound => Error::PathNotFound,
-                NotifyError::WatchNotFound => Error::WatchNotFound,
-            })
+            .map_err(|e| e.into())
+    }
+
+    /// Removes a file or directory
+    pub fn unwatch<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
+        self.watcher.unwatch(path).map_err(|e| e.into())
     }
 
     pub fn receive(&self) -> impl Stream<Item = Event> + '_ {
@@ -142,6 +142,17 @@ impl Watcher {
                 }
             }
         })
+    }
+}
+
+impl From<notify::Error> for Error {
+    fn from(e: notify::Error) -> Error {
+        match e {
+            NotifyError::Generic(s) => Error::Generic(s),
+            NotifyError::Io(err) => Error::Io(err),
+            NotifyError::PathNotFound => Error::PathNotFound,
+            NotifyError::WatchNotFound => Error::WatchNotFound,
+        }
     }
 }
 
@@ -211,7 +222,7 @@ mod tests {
         let dir_path = &dir;
 
         let mut w = Watcher::new(DELAY);
-        w.add(dir_path).unwrap();
+        w.watch(dir_path).unwrap();
 
         let file1_path = dir_path.join("file1.log");
         let mut file1 = File::create(&file1_path)?;
@@ -234,7 +245,7 @@ mod tests {
         let dir = tempdir().unwrap().into_path();
 
         let mut w = Watcher::new(DELAY);
-        w.add(&dir).unwrap();
+        w.watch(&dir).unwrap();
 
         let file1_path = &dir.join("file1.log");
         let mut file1 = File::create(&file1_path)?;
@@ -256,6 +267,7 @@ mod tests {
         Ok(())
     }
 
+    /// Must add watch to file target to work on both linux and macOS
     #[tokio::test]
     #[cfg(unix)]
     async fn test_watch_symlink_write_after_create() -> io::Result<()> {
@@ -265,7 +277,7 @@ mod tests {
         let w = RefCell::new(Watcher::new(DELAY));
         {
             let mut w_mut = w.borrow_mut();
-            w_mut.add(&dir).unwrap();
+            w_mut.watch(&dir).unwrap();
         }
 
         let file_path = &excluded_dir.join("file1.log");
@@ -287,7 +299,7 @@ mod tests {
 
         {
             let mut w_mut = w.borrow_mut();
-            w_mut.add(&file_path).unwrap();
+            w_mut.watch(&file_path).unwrap();
         }
 
         wait_and_append!(file);
