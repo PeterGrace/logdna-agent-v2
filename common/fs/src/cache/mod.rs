@@ -1,7 +1,7 @@
 use crate::cache::entry::Entry;
 use crate::cache::event::Event;
 use crate::cache::tailed_file::TailedFile;
-use crate::cache::watch::{WatchEvent, Watcher};
+use notify_stream::{Watcher, Event as WatchEvent, Error as WatchError};
 use crate::rule::{GlobRule, Rules, Status};
 
 use std::cell::RefCell;
@@ -27,9 +27,9 @@ pub mod event;
 pub mod tailed_file;
 pub use dir_path::{DirPathBuf, DirPathBufError};
 use metrics::Metrics;
+use std::time::Duration;
 
-mod watch;
-
+type WatchDescriptor = PathBuf;
 type Children = HashMap<OsString, EntryKey>;
 type Symlinks = HashMap<PathBuf, Vec<EntryKey>>;
 type WatchDescriptors = HashMap<WatchDescriptor, Vec<EntryKey>>;
@@ -42,7 +42,7 @@ type FsResult<T> = Result<T, Error>;
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("error watching: {0:?} {1:?}")]
-    Watch(PathBuf, io::Error),
+    Watch(PathBuf, notify_stream::Error),
     #[error("got event for untracked watch descriptor: {0:?}")]
     WatchEvent(WatchDescriptor),
     #[error("the inotify event queue has overflowed and events have presumably been lost")]
@@ -85,15 +85,16 @@ impl FileSystem {
                 panic!("initial dirs must be dirs")
             }
         });
-        let mut watcher = Watcher::new().expect("unable to initialize inotify");
+        let mut watcher = Watcher::new(Duration::from_millis(1000));
 
         let mut entries = SlotMap::new();
         let root = entries.insert(Entry::Dir {
             name: "/".into(),
             parent: None,
             children: Children::new(),
-            wd: watcher.watch("/").expect("unable to watch /"),
+            wd: PathBuf::from("/"),
         });
+        watcher.watch("/").expect("unable to watch /");
 
         let mut initial_dir_rules = Rules::new();
         for path in initial_dirs.iter() {
@@ -226,22 +227,21 @@ impl FileSystem {
 
         debug!("handling inotify event {:#?}", watch_event);
 
+        // TODO: Remove OsString names
         let result = match watch_event {
-            WatchEvent::Create { wd, name } | WatchEvent::MovedTo { wd, name, .. } => {
-                self.process_create(&wd, name, events, &mut _entries)
+            WatchEvent::Create(wd) => {
+                self.process_create(&wd, OsString::new(), events, &mut _entries)
             }
-            WatchEvent::Modify { wd } => self.process_modify(&wd, events),
-            WatchEvent::Delete { wd, name } | WatchEvent::MovedFrom { wd, name, .. } => {
-                self.process_delete(&wd, name, events, &mut _entries)
+            WatchEvent::Write(wd) => self.process_modify(&wd, events),
+            WatchEvent::Remove(wd) => {
+                self.process_delete(&wd, OsString::new(), events, &mut _entries)
             }
-            WatchEvent::Move {
-                from_wd,
-                from_name,
-                to_wd,
-                to_name,
-            } => {
+            WatchEvent::Rename(from_wd, to_wd) => {
                 // directories can't have hard links so we can expect just one entry for these watch
                 // descriptors
+                let from_name = OsString::new();
+                let to_name = OsString::new();
+
                 let is_from_path_ok = self
                     .get_first_entry(&from_wd)
                     .map(|entry| self.entry_path_passes(entry, &from_name, &_entries))
@@ -265,8 +265,12 @@ impl FileSystem {
                     Ok(())
                 }
             }
-            // Files are being updated too often for inotify to catch up
-            WatchEvent::Overflow => Err(Error::WatchOverflow),
+            WatchEvent::Error(e, p) => {
+                warn!("There was an error mapping a file change: {:?} ({:?})", e, p);
+            }
+            _ => {
+                // TODO: Map the rest of the events
+            }
         };
 
         if let Err(e) = result {
@@ -520,7 +524,7 @@ impl FileSystem {
         match action {
             Action::Return(key) => Ok(Some(key)),
             Action::CreateFile => {
-                let wd = self
+                self
                     .watcher
                     .watch(path)
                     .map_err(|e| Error::Watch(path.to_owned(), e))?;
@@ -528,7 +532,7 @@ impl FileSystem {
                 let new_entry = Entry::File {
                     name: component,
                     parent: parent_ref,
-                    wd,
+                    wd: path.into(),
                     data: RefCell::new(TailedFile::new(path).map_err(Error::File)?),
                 };
 
@@ -539,7 +543,7 @@ impl FileSystem {
                 Ok(Some(new_key))
             }
             Action::CreateSymlink(real) => {
-                let wd = self
+                self
                     .watcher
                     .watch(path)
                     .map_err(|e| Error::Watch(path.to_owned(), e))?;
@@ -548,7 +552,7 @@ impl FileSystem {
                     name: component,
                     parent: parent_ref,
                     link: real.clone(),
-                    wd,
+                    wd: path.into(),
                     rules: into_rules(real.clone()),
                 };
 
@@ -610,7 +614,7 @@ impl FileSystem {
                 if let Err(e) = self.watcher.unwatch(wd) {
                     // Log and continue
                     debug!(
-                        "unwatching {:?} resulted in an error, likely due to a dangling symlink {}",
+                        "unwatching {:?} resulted in an error, likely due to a dangling symlink {:?}",
                         path, e
                     );
                 }
@@ -802,7 +806,7 @@ impl FileSystem {
                 Action::Return(key) => key,
                 Action::Lookup(ref link) => self.lookup(link, _entries).ok_or(Error::Lookup)?,
                 Action::CreateDir => {
-                    let wd = self
+                    self
                         .watcher
                         .watch(&current_path)
                         .map_err(|e| Error::Watch(current_path.to_owned(), e))?;
@@ -811,13 +815,13 @@ impl FileSystem {
                         name: component.clone(),
                         parent: Some(m_entry),
                         children: HashMap::new(),
-                        wd,
+                        wd: current_path,
                     };
 
                     self.register_as_child(m_entry, new_entry, _entries)?
                 }
                 Action::CreateSymlink(real) => {
-                    let wd = self
+                    self
                         .watcher
                         .watch(&current_path)
                         .map_err(|e| Error::Watch(current_path.to_owned(), e))?;
@@ -826,7 +830,7 @@ impl FileSystem {
                         name: component.clone(),
                         parent: m_entry,
                         link: real.clone(),
-                        wd,
+                        wd: current_path,
                         rules: into_rules(real.clone()),
                     };
 

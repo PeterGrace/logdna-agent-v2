@@ -305,10 +305,9 @@ impl Tailer {
     /// Runs the main logic of the tailer, this can only be run once so Tailer is consumed
     pub fn process<'a>(
         &mut self,
-        buf: &'a mut [u8],
     ) -> Result<impl Stream<Item = LazyLineSerializer> + 'a, std::io::Error> {
         let events = {
-            match FileSystem::stream_events(self.fs_cache.clone(), buf) {
+            match FileSystem::stream_events(self.fs_cache.clone()) {
                 Ok(event) => event,
                 Err(e) => {
                     warn!("tailer stream raised exception: {:?}", e);

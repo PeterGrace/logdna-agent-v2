@@ -68,7 +68,7 @@ pub enum Event {
     /// `Error` is emitted immediately after a error has been detected.
     ///
     ///  This event may contain a path for which the error was detected.
-    Error(Option<PathId>),
+    Error(Error, Option<PathId>),
 }
 
 #[derive(Debug)]
@@ -120,7 +120,7 @@ impl Watcher {
         self.watcher.unwatch(path).map_err(|e| e.into())
     }
 
-    pub fn receive(&self) -> impl Stream<Item = Event> + '_ {
+    pub fn receive<'a>(&'a self) -> impl Stream<Item = Event> + 'a {
         stream::unfold(&self.rx, |rx| async move {
             loop {
                 let received = rx.recv().await.expect("channel can not be closed");
@@ -136,7 +136,7 @@ impl Watcher {
                     DebouncedEvent::Remove(p) => Some(Event::Remove(p)),
                     DebouncedEvent::Rename(source, dest) => Some(Event::Rename(source, dest)),
                     DebouncedEvent::Rescan => Some(Event::Rescan),
-                    DebouncedEvent::Error(_, p) => Some(Event::Error(p)),
+                    DebouncedEvent::Error(e, p) => Some(Event::Error(e.into(), p)),
                 } {
                     return Some((mapped_event, rx));
                 }

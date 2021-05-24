@@ -2,9 +2,7 @@ use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use inotify::WatchDescriptor;
-
-use crate::cache::TailedFile;
+use crate::cache::{TailedFile, WatchDescriptor};
 use crate::cache::{Children, EntryKey};
 use crate::rule::Rules;
 
