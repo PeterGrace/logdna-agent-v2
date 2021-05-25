@@ -4,8 +4,8 @@ use futures::{stream, Stream};
 use notify::{DebouncedEvent, Error as NotifyError, RecursiveMode, Watcher as NotifyWatcher};
 use std::io;
 use std::path::Path;
-use std::time::Duration;
 use std::rc::Rc;
+use std::time::Duration;
 
 type PathId = std::path::PathBuf;
 
@@ -22,12 +22,6 @@ type OsWatcher = notify::PollWatcher;
 /// Gives us the ability to hide/map events from the used library and minimize code changes in
 /// case the notify library adds breaking changes.
 pub enum Event {
-    /// `NoticeWrite` is emitted immediately after the first write event for the path.
-    ///
-    /// If you are reading from that file, you should probably close it immediately and discard all
-    /// data you read from it.
-    NoticeWrite(PathId),
-
     /// `NoticeRemove` is emitted immediately after a remove or rename event for the path.
     ///
     /// The file will continue to exist until its last file handle is closed.
@@ -42,9 +36,6 @@ pub enum Event {
 
     /// `Write` is emitted when a file has been written to and no events were detected for the path
     /// within the specified time frame.
-    ///
-    /// `Write` events have a higher priority than `Chmod`. `Chmod` will not be emitted if it's
-    /// detected before the `Write` event has been emitted.
     ///
     /// Upon receiving a `Create` event for a directory, it is necessary to scan the newly created
     /// directory for contents. The directory can contain files or directories if those contents
@@ -106,7 +97,10 @@ impl Watcher {
             }
         });
 
-        Self { watcher, rx: Rc::new(rx) }
+        Self {
+            watcher,
+            rx: Rc::new(rx),
+        }
     }
 
     /// Adds a new directory or file to watch
@@ -121,16 +115,19 @@ impl Watcher {
         self.watcher.unwatch(path).map_err(|e| e.into())
     }
 
+    /// Starts receiving the watcher events
     pub fn receive(&self) -> impl Stream<Item = Event> {
         let rx = Rc::clone(&self.rx);
         stream::unfold(rx, |rx| async move {
             loop {
                 let received = rx.recv().await.expect("channel can not be closed");
                 if let Some(mapped_event) = match received {
-                    DebouncedEvent::NoticeWrite(p) => Some(Event::NoticeWrite(p)),
                     DebouncedEvent::NoticeRemove(p) => Some(Event::NoticeRemove(p)),
                     DebouncedEvent::Create(p) => Some(Event::Create(p)),
                     DebouncedEvent::Write(p) => Some(Event::Write(p)),
+                    // NoticeWrite can be useful but we don't use it
+                    // TODO: Define if NoticeWrite should be ignored
+                    DebouncedEvent::NoticeWrite(p) => Some(Event::Write(p)),
                     DebouncedEvent::Chmod(_) => {
                         // Ignore attribute changes
                         None
@@ -264,8 +261,8 @@ mod tests {
         wait_and_append!(file1);
         take!(stream, items);
 
-        is_match!(&items[1], NoticeWrite, file1_path);
-        is_match!(&items[2], Write, file1_path);
+        is_match!(&items[1], Write, file1_path);
+        is_match!(&items[1], Write, file1_path);
         Ok(())
     }
 
@@ -321,13 +318,12 @@ mod tests {
             let items: Vec<_> = items
                 .iter()
                 .filter(|e| match e {
-                    Event::NoticeWrite(p) => p.as_os_str() == file_path.as_os_str(),
                     Event::Write(p) => p.as_os_str() == file_path.as_os_str(),
                     _ => false,
                 })
                 .collect();
 
-            is_match!(&items[0], NoticeWrite, file_path);
+            is_match!(&items[0], Write, file_path);
             is_match!(&items[1], Write, file_path);
         }
         Ok(())

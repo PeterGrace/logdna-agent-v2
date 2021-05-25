@@ -305,19 +305,11 @@ impl Tailer {
     /// Runs the main logic of the tailer, this can only be run once so Tailer is consumed
     pub fn process<'a>(
         &mut self,
-    ) -> Result<impl Stream<Item = LazyLineSerializer> + 'a, std::io::Error> {
-        let events = {
-            match FileSystem::stream_events(self.fs_cache.clone()) {
-                Ok(event) => event,
-                Err(e) => {
-                    warn!("tailer stream raised exception: {:?}", e);
-                    return Err(e);
-                }
-            }
-        };
+    ) -> impl Stream<Item = LazyLineSerializer> + 'a {
+        let events = FileSystem::stream_events(self.fs_cache.clone());
 
         debug!("Tailer starting with lookback: {:?}", self.lookback_config);
-        Ok(events
+        events
             .then({
                 let fs = self.fs_cache.clone();
                 let lookback_config = self.lookback_config.clone();
@@ -338,7 +330,7 @@ impl Tailer {
                 }
             })
             .filter_map(|x| async move { x })
-            .flatten())
+            .flatten()
     }
 }
 
@@ -405,7 +397,6 @@ mod test {
 
                 let stream = tailer
                     .process()
-                    .expect("failed to read events")
                     .timeout(std::time::Duration::from_millis(500));
 
                 let write_files = async move {
@@ -454,7 +445,6 @@ mod test {
 
                 let stream = tailer
                     .process()
-                    .expect("failed to read events")
                     .timeout(std::time::Duration::from_millis(500));
 
                 let write_files = async move {
@@ -504,7 +494,6 @@ mod test {
 
                 let stream = tailer
                     .process()
-                    .expect("failed to read events")
                     .timeout(std::time::Duration::from_millis(500));
 
                 let write_files = async move {

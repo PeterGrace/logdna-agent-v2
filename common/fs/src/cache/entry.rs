@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::cache::{TailedFile, WatchDescriptor};
 use crate::cache::{Children, EntryKey};
+use crate::cache::{TailedFile, WatchDescriptor};
 use crate::rule::Rules;
 
 use crate::cache::tailed_file::LazyLineSerializer;

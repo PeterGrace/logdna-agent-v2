@@ -1,8 +1,8 @@
 use crate::cache::entry::Entry;
 use crate::cache::event::Event;
 use crate::cache::tailed_file::TailedFile;
-use notify_stream::{Watcher, Event as WatchEvent, Error as WatchError};
 use crate::rule::{GlobRule, Rules, Status};
+use notify_stream::{Event as WatchEvent, Watcher};
 
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
@@ -171,62 +171,40 @@ impl FileSystem {
 
     pub fn stream_events<'a>(
         fs: Arc<Mutex<FileSystem>>,
-    ) -> Result<impl Stream<Item = Event> + 'a, std::io::Error> {
+    ) -> impl Stream<Item = Event> + 'a {
+        let events_stream = {
+            let watcher = &fs
+                .try_lock()
+                .expect("could not lock filesystem cache")
+                .watcher;
+            watcher.receive()
+        };
 
+        let initial_events = {
+            let mut fs = fs.try_lock().expect("could not lock filesystem cache");
 
-        let watcher = &fs
-            .try_lock()
-            .expect("could not lock filesystem cache")
-            .watcher;
-        let events_stream = watcher.receive();
+            let mut acc = Vec::new();
+            if !fs.initial_events.is_empty() {
+                for event in std::mem::replace(&mut fs.initial_events, Vec::new()) {
+                    acc.push(event)
+                }
+            }
+            acc
+        };
 
-        Ok(events_stream.map(move |_| Event::New(EntryKey::default())))
+        let events = events_stream.map(move |event| {
+            let fs = fs.clone();
+            {
+                let mut acc = Vec::new();
 
-        // let events_stream = {
-        //     match fs
-        //         .try_lock()
-        //         .expect("could not lock filesystem cache")
-        //         .watcher
-        //         .event_stream(buf)
-        //     {
-        //         Ok(events) => events,
-        //         Err(e) => {
-        //             error!("error reading from watcher: {}", e);
-        //             return Err(e);
-        //         }
-        //     }
-        // };
-        //
-        // let initial_events = {
-        //     let mut fs = fs.try_lock().expect("could not lock filesystem cache");
-        //
-        //     let mut acc = Vec::new();
-        //     if !fs.initial_events.is_empty() {
-        //         for event in std::mem::replace(&mut fs.initial_events, Vec::new()) {
-        //             acc.push(event)
-        //         }
-        //     }
-        //     acc
-        // };
-        //
-        // let events = events_stream.into_stream().map(move |event| {
-        //     let fs = fs.clone();
-        //     {
-        //         let mut acc = Vec::new();
-        //
-        //         match event {
-        //             Ok(event) => {
-        //                 fs.try_lock()
-        //                     .expect("couldn't lock filesystem cache")
-        //                     .process(event, &mut acc);
-        //                 futures::stream::iter(acc)
-        //             }
-        //             _ => panic!("Inotify error"),
-        //         }
-        //     }
-        // });
-        //
-        // Ok(futures::stream::iter(initial_events).chain(events.flatten()))
+                fs.try_lock()
+                    .expect("couldn't lock filesystem cache")
+                    .process(event, &mut acc);
+                futures::stream::iter(acc)
+            }
+        });
+
+        futures::stream::iter(initial_events).chain(events.flatten())
     }
 
     /// Handles inotify events and may produce Event(s) that are returned upstream through sender
@@ -275,7 +253,10 @@ impl FileSystem {
                 }
             }
             WatchEvent::Error(e, p) => {
-                warn!("There was an error mapping a file change: {:?} ({:?})", e, p);
+                warn!(
+                    "There was an error mapping a file change: {:?} ({:?})",
+                    e, p
+                );
                 Ok(())
             }
             _ => {
@@ -535,8 +516,7 @@ impl FileSystem {
         match action {
             Action::Return(key) => Ok(Some(key)),
             Action::CreateFile => {
-                self
-                    .watcher
+                self.watcher
                     .watch(path)
                     .map_err(|e| Error::Watch(path.to_owned(), e))?;
 
@@ -554,8 +534,7 @@ impl FileSystem {
                 Ok(Some(new_key))
             }
             Action::CreateSymlink(real) => {
-                self
-                    .watcher
+                self.watcher
                     .watch(path)
                     .map_err(|e| Error::Watch(path.to_owned(), e))?;
 
@@ -817,8 +796,7 @@ impl FileSystem {
                 Action::Return(key) => key,
                 Action::Lookup(ref link) => self.lookup(link, _entries).ok_or(Error::Lookup)?,
                 Action::CreateDir => {
-                    self
-                        .watcher
+                    self.watcher
                         .watch(&current_path)
                         .map_err(|e| Error::Watch(current_path.to_owned(), e))?;
 
@@ -832,8 +810,7 @@ impl FileSystem {
                     self.register_as_child(m_entry, new_entry, _entries)?
                 }
                 Action::CreateSymlink(real) => {
-                    self
-                        .watcher
+                    self.watcher
                         .watch(&current_path)
                         .map_err(|e| Error::Watch(current_path.to_owned(), e))?;
 
@@ -1106,7 +1083,6 @@ mod tests {
             tokio_test::block_on(async {
                 futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::take(
                     FileSystem::stream_events($x.clone())
-                        .expect("failed to read events")
                         .timeout(std::time::Duration::from_millis(500)),
                     $y,
                 ))
