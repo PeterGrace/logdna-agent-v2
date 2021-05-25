@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
 use futures::{Stream, StreamExt};
-use inotify::WatchDescriptor;
 use slotmap::{DefaultKey, SlotMap};
 use std::collections::hash_map::Entry as HashMapEntry;
 use std::collections::HashMap;

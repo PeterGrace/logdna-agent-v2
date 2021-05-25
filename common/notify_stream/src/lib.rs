@@ -91,7 +91,9 @@ impl Watcher {
         let (async_tx, rx) = async_channel::unbounded();
         tokio::task::spawn_blocking(move || {
             while let Ok(event) = blocking_rx.recv() {
-                async_tx.try_send(event).expect("channel can not be closed");
+                // Safely ignore closed error as it's caused by the runtime being dropped
+                // It can't result in a `TrySendError::Full` as it's an unbounded channel
+                let _ = async_tx.try_send(event);
             }
         });
 
@@ -104,7 +106,7 @@ impl Watcher {
     /// Adds a new directory or file to watch
     pub fn watch<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
         self.watcher
-            .watch(path, RecursiveMode::Recursive)
+            .watch(path, RecursiveMode::NonRecursive)
             .map_err(|e| e.into())
     }
 
