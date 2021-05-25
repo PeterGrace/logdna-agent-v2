@@ -25,12 +25,14 @@ pub enum Event {
     /// `NoticeRemove` is emitted immediately after a remove or rename event for the path.
     ///
     /// The file will continue to exist until its last file handle is closed.
-    NoticeRemove(PathId),
+    ///
+    /// `Write` events might follow as part of the normal flow.
+    Remove(PathId),
 
     /// `Create` is emitted when a file or directory has been created and no events were detected
     /// for the path within the specified time frame.
     ///
-    /// `Create` events have a higher priority than `Write` and `Chmod`. These events will not be
+    /// `Create` events have a higher priority than `Write`, `Write` will not be
     /// emitted if they are detected before the `Create` event has been emitted.
     Create(PathId),
 
@@ -42,10 +44,6 @@ pub enum Event {
     /// were created before the directory could be watched, or if the directory was moved into the
     /// watched directory.
     Write(PathId),
-
-    /// `Remove` is emitted when a file or directory has been removed and no events were detected
-    /// for the path within the specified time frame.
-    Remove(PathId),
 
     /// `Rename` is emitted when a file or directory has been moved within a watched directory and
     /// no events were detected for the new path within the specified time frame.
@@ -122,20 +120,19 @@ impl Watcher {
             loop {
                 let received = rx.recv().await.expect("channel can not be closed");
                 if let Some(mapped_event) = match received {
-                    DebouncedEvent::NoticeRemove(p) => Some(Event::NoticeRemove(p)),
+                    DebouncedEvent::NoticeRemove(p) => Some(Event::Remove(p)),
                     DebouncedEvent::Create(p) => Some(Event::Create(p)),
                     DebouncedEvent::Write(p) => Some(Event::Write(p)),
-                    // NoticeWrite can be useful but we don't use it
-                    // TODO: Define if NoticeWrite should be ignored
-                    DebouncedEvent::NoticeWrite(p) => Some(Event::Write(p)),
-                    DebouncedEvent::Chmod(_) => {
-                        // Ignore attribute changes
-                        None
-                    }
-                    DebouncedEvent::Remove(p) => Some(Event::Remove(p)),
                     DebouncedEvent::Rename(source, dest) => Some(Event::Rename(source, dest)),
+                    // TODO: Define what to do with Rescan
                     DebouncedEvent::Rescan => Some(Event::Rescan),
                     DebouncedEvent::Error(e, p) => Some(Event::Error(e.into(), p)),
+                    // NoticeWrite can be useful but we don't use it
+                    DebouncedEvent::NoticeWrite(_) => None,
+                    // Ignore `Remove`: we use `NoticeRemove` that comes before in the flow
+                    DebouncedEvent::Remove(_) => None,
+                    // Ignore attribute changes
+                    DebouncedEvent::Chmod(_) => None,
                 } {
                     return Some((mapped_event, rx));
                 }
@@ -240,6 +237,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_write_delete() -> io::Result<()> {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut w = Watcher::new(DELAY);
+        w.watch(dir_path).unwrap();
+
+        let file_path = dir_path.join("file1.log");
+        let mut file = File::create(&file_path)?;
+        append!(file);
+
+        let stream = w.receive();
+        pin_mut!(stream);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut items = Vec::new();
+        take!(stream, items);
+        // Depending on timers, it can get debounced into a single create
+        assert!(!items.is_empty());
+        is_match!(&items[0], Create, file_path);
+
+        wait_and_append!(file);
+        std::fs::remove_file(&file_path)?;
+        take!(stream, items);
+
+        let is_equal = |p: &PathId| p.as_os_str() == file_path.as_os_str();
+        let items: Vec<_> = items
+            .iter()
+            .filter(|e| match e {
+                Event::Write(p) => is_equal(p),
+                Event::Remove(p) => is_equal(p),
+                Event::Create(p) => is_equal(p),
+                _ => false,
+            })
+            .collect();
+
+        is_match!(items.last().unwrap(), Remove, file_path);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_watch_file_write_after_create() -> io::Result<()> {
         let dir = tempdir().unwrap().into_path();
 
@@ -261,7 +300,6 @@ mod tests {
         wait_and_append!(file1);
         take!(stream, items);
 
-        is_match!(&items[1], Write, file1_path);
         is_match!(&items[1], Write, file1_path);
         Ok(())
     }
@@ -324,7 +362,6 @@ mod tests {
                 .collect();
 
             is_match!(&items[0], Write, file_path);
-            is_match!(&items[1], Write, file_path);
         }
         Ok(())
     }
