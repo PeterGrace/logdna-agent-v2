@@ -1,8 +1,7 @@
 extern crate notify;
 
 use futures::{stream, Stream};
-use notify::{DebouncedEvent, Error as NotifyError, RecursiveMode, Watcher as NotifyWatcher};
-use std::io;
+use notify::{DebouncedEvent, Error as NotifyError, Watcher as NotifyWatcher};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
@@ -16,7 +15,7 @@ type OsWatcher = notify::ReadDirectoryChangesWatcher;
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 type OsWatcher = notify::PollWatcher;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 /// Event wrapper to that hides platform and implementation details.
 ///
 /// Gives us the ability to hide/map events from the used library and minimize code changes in
@@ -61,7 +60,7 @@ pub enum Event {
     Error(Error, Option<PathId>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Error {
     /// Generic error
     ///
@@ -69,13 +68,18 @@ pub enum Error {
     Generic(String),
 
     /// I/O errors
-    Io(io::Error),
+    Io(String),
 
     /// The provided path does not exist
     PathNotFound,
 
     /// Attempted to remove a watch that does not exist
     WatchNotFound,
+}
+
+pub enum RecursiveMode {
+    Recursive,
+    NonRecursive,
 }
 
 pub struct Watcher {
@@ -104,10 +108,14 @@ impl Watcher {
     }
 
     /// Adds a new directory or file to watch
-    pub fn watch<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
+    pub fn watch<P: AsRef<Path>>(&mut self, path: P, mode: RecursiveMode) -> Result<(), Error> {
         self.watcher
-            .watch(path, RecursiveMode::NonRecursive)
+            .watch(path, mode.into())
             .map_err(|e| e.into())
+    }
+
+    fn watch_recursive<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
+        return self.watch(path, RecursiveMode::Recursive);
     }
 
     /// Removes a file or directory
@@ -147,9 +155,18 @@ impl From<notify::Error> for Error {
     fn from(e: notify::Error) -> Error {
         match e {
             NotifyError::Generic(s) => Error::Generic(s),
-            NotifyError::Io(err) => Error::Io(err),
+            NotifyError::Io(err) => Error::Io(format!("{}", err)),
             NotifyError::PathNotFound => Error::PathNotFound,
             NotifyError::WatchNotFound => Error::WatchNotFound,
+        }
+    }
+}
+
+impl From<RecursiveMode> for notify::RecursiveMode {
+    fn from(e: RecursiveMode) -> Self {
+        match e {
+            RecursiveMode::Recursive => notify::RecursiveMode::Recursive,
+            RecursiveMode::NonRecursive => notify::RecursiveMode::NonRecursive,
         }
     }
 }
@@ -163,6 +180,7 @@ mod tests {
     use std::fs::File;
     use std::io::{self, Write};
     use tempfile::tempdir;
+    use predicates::prelude::*;
 
     static DELAY: Duration = Duration::from_millis(200);
 
@@ -219,7 +237,7 @@ mod tests {
         let dir_path = &dir;
 
         let mut w = Watcher::new(DELAY);
-        w.watch(dir_path).unwrap();
+        w.watch_recursive(dir_path).unwrap();
 
         let file1_path = dir_path.join("file1.log");
         let mut file1 = File::create(&file1_path)?;
@@ -243,7 +261,7 @@ mod tests {
         let dir_path = dir.path();
 
         let mut w = Watcher::new(DELAY);
-        w.watch(dir_path).unwrap();
+        w.watch_recursive(dir_path).unwrap();
 
         let file_path = dir_path.join("file1.log");
         let mut file = File::create(&file_path)?;
@@ -284,7 +302,7 @@ mod tests {
         let dir = tempdir().unwrap().into_path();
 
         let mut w = Watcher::new(DELAY);
-        w.watch(&dir).unwrap();
+        w.watch_recursive(&dir).unwrap();
 
         let file1_path = &dir.join("file1.log");
         let mut file1 = File::create(&file1_path)?;
@@ -309,11 +327,11 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn test_watch_symlink_write_after_create() -> io::Result<()> {
-        let dir = tempdir().unwrap().into_path();
-        let excluded_dir = tempdir().unwrap().into_path();
+        let dir = tempdir()?.into_path();
+        let excluded_dir = tempdir()?.into_path();
 
         let mut w = Watcher::new(DELAY);
-        w.watch(&dir).unwrap();
+        w.watch_recursive(&dir).unwrap();
 
         let file_path = &excluded_dir.join("file1.log");
         let symlink_path = &dir.join("symlink.log");
@@ -329,7 +347,7 @@ mod tests {
         assert!(!items.is_empty());
         is_match!(&items[0], Create, symlink_path);
 
-        w.watch(&file_path).unwrap();
+        w.watch_recursive(&file_path).unwrap();
 
         wait_and_append!(file);
 
@@ -344,6 +362,80 @@ mod tests {
 
         // macOS will produce events for both the symlink and the file
         // linux will produce events for the real file manually added
+        let items: Vec<_> = items
+            .iter()
+            .filter(|e| match e {
+                Event::Write(p) => p.as_os_str() == file_path.as_os_str(),
+                _ => false,
+            })
+            .collect();
+
+        is_match!(&items[0], Write, file_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_watch_symlink_directory() -> io::Result<()> {
+        let dir = tempdir()?.into_path();
+        let excluded_dir = tempdir()?.into_path();
+
+        let file1_path = &excluded_dir.join("file1.log");
+        let symlink_path = &dir.join("symlink-dir");
+        let mut file1 = File::create(&file1_path)?;
+        std::os::unix::fs::symlink(&excluded_dir, &symlink_path)?;
+
+        let mut w = Watcher::new(DELAY);
+        w.watch_recursive(&dir).unwrap();
+
+        let stream = w.receive();
+        pin_mut!(stream);
+
+        let mut items = Vec::new();
+        take!(stream, items);
+
+        wait_and_append!(file1);
+        take!(stream, items);
+
+        let file2_path = &excluded_dir.join("file2.log");
+        let mut file2 = File::create(&file2_path)?;
+        wait_and_append!(file2);
+        take!(stream, items);
+
+        let predicate_fn = predicate::in_iter(items);
+
+        // The file name is yielded as a child of the symlink dir
+        assert!(predicate_fn.eval(&Event::Write(symlink_path.join(file1_path.file_name().unwrap()))));
+        assert!(predicate_fn.eval(&Event::Create(symlink_path.join(file2_path.file_name().unwrap()))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_watch_hardlink_file() -> io::Result<()> {
+        let dir = tempdir()?.into_path();
+        let excluded_dir = tempdir()?.into_path();
+
+        let file_path = &excluded_dir.join("file1.log");
+        let link_path = &dir.join("symlink.log");
+        let mut file = File::create(&file_path)?;
+        std::fs::hard_link(&file_path, &link_path)?;
+
+        let mut w = Watcher::new(DELAY);
+        w.watch_recursive(&dir).unwrap();
+
+        let stream = w.receive();
+        pin_mut!(stream);
+
+        let mut items = Vec::new();
+        take!(stream, items);
+
+        w.watch_recursive(&file_path).unwrap();
+
+        wait_and_append!(file);
+        take!(stream, items);
+
+        // macOS will produce events for both the symlink and the file
+        // linux will produce events for the file only
         let items: Vec<_> = items
             .iter()
             .filter(|e| match e {
