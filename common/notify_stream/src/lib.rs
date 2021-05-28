@@ -160,7 +160,6 @@ mod tests {
 
     use futures::StreamExt;
     use pin_utils::pin_mut;
-    use std::cell::RefCell;
     use std::fs::File;
     use std::io::{self, Write};
     use tempfile::tempdir;
@@ -313,58 +312,47 @@ mod tests {
         let dir = tempdir().unwrap().into_path();
         let excluded_dir = tempdir().unwrap().into_path();
 
-        let w = RefCell::new(Watcher::new(DELAY));
-        {
-            let mut w_mut = w.borrow_mut();
-            w_mut.watch(&dir).unwrap();
-        }
+        let mut w = Watcher::new(DELAY);
+        w.watch(&dir).unwrap();
 
         let file_path = &excluded_dir.join("file1.log");
         let symlink_path = &dir.join("symlink.log");
         let mut file = File::create(&file_path)?;
         std::os::unix::fs::symlink(&file_path, &symlink_path)?;
 
-        {
-            let w_ref = w.borrow();
-            let stream = w_ref.receive();
-            pin_mut!(stream);
+        let stream = w.receive();
+        pin_mut!(stream);
 
-            let mut items = Vec::new();
-            take!(stream, items);
+        let mut items = Vec::new();
+        take!(stream, items);
 
-            assert!(!items.is_empty());
-            is_match!(&items[0], Create, symlink_path);
-        }
+        assert!(!items.is_empty());
+        is_match!(&items[0], Create, symlink_path);
 
-        {
-            let mut w_mut = w.borrow_mut();
-            w_mut.watch(&file_path).unwrap();
-        }
+        w.watch(&file_path).unwrap();
 
         wait_and_append!(file);
 
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
-        {
-            let w_ref = w.borrow();
-            let stream = w_ref.receive();
-            pin_mut!(stream);
 
-            let mut items = Vec::new();
-            take!(stream, items);
+        let stream = w.receive();
+        pin_mut!(stream);
 
-            // macOS will produce events for both the symlink and the file
-            // linux will produce events for the real file manually added
-            let items: Vec<_> = items
-                .iter()
-                .filter(|e| match e {
-                    Event::Write(p) => p.as_os_str() == file_path.as_os_str(),
-                    _ => false,
-                })
-                .collect();
+        let mut items = Vec::new();
+        take!(stream, items);
 
-            is_match!(&items[0], Write, file_path);
-        }
+        // macOS will produce events for both the symlink and the file
+        // linux will produce events for the real file manually added
+        let items: Vec<_> = items
+            .iter()
+            .filter(|e| match e {
+                Event::Write(p) => p.as_os_str() == file_path.as_os_str(),
+                _ => false,
+            })
+            .collect();
+
+        is_match!(&items[0], Write, file_path);
         Ok(())
     }
 }
