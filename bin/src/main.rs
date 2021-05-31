@@ -147,9 +147,7 @@ async fn main() {
         tokio::spawn(offset_state.run().unwrap());
     }
 
-    let fs_source = fs_source
-        .process()
-        .map(StrictOrLazyLineBuilder::Lazy);
+    let fs_source = fs_source.process().map(StrictOrLazyLineBuilder::Lazy);
 
     #[cfg(feature = "libjournald")]
     let journald_source = journald_source.map(StrictOrLazyLineBuilder::Strict);

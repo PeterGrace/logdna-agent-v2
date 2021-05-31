@@ -109,14 +109,26 @@ impl Watcher {
 
     /// Adds a new directory or file to watch
     pub fn watch<P: AsRef<Path>>(&mut self, path: P, mode: RecursiveMode) -> Result<(), Error> {
-        self.watcher
-            .watch(path, mode.into())
-            .map_err(|e| e.into())
+        self.watcher.watch(path, mode.into()).map_err(|e| e.into())
     }
 
     /// Removes a file or directory
     pub fn unwatch<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
         self.watcher.unwatch(path).map_err(|e| e.into())
+    }
+
+    /// Removes a file or directory, ignoring watch not found errors.
+    ///
+    /// Returns Ok(true) when watch was found and removed.
+    pub fn unwatch_if_exists<P: AsRef<Path>>(&mut self, path: P) -> Result<bool, Error> {
+        match self.watcher.unwatch(path).map_err(|e| e.into()) {
+            Ok(_) => Ok(true),
+            Err(e) => match e {
+                // Ignore watch not found
+                Error::WatchNotFound => Ok(false),
+                _ => Err(e),
+            },
+        }
     }
 
     /// Starts receiving the watcher events
@@ -173,10 +185,10 @@ mod tests {
 
     use futures::StreamExt;
     use pin_utils::pin_mut;
+    use predicates::prelude::*;
     use std::fs::File;
     use std::io::{self, Write};
     use tempfile::tempdir;
-    use predicates::prelude::*;
 
     static DELAY: Duration = Duration::from_millis(200);
 
@@ -225,6 +237,19 @@ mod tests {
             tokio::time::sleep(DELAY.clone().mul_f32(3.0)).await;
             append!($file);
         };
+    }
+
+    #[tokio::test]
+    async fn test_unwatch_if_exists() {
+        let dir = tempdir().unwrap();
+        let dir_untracked = tempdir().unwrap();
+        let mut w = Watcher::new(DELAY);
+        w.watch(dir.path(), RecursiveMode::Recursive).unwrap();
+        assert!(matches!(
+            w.unwatch_if_exists(dir_untracked.path()),
+            Ok(false)
+        ));
+        assert!(matches!(w.unwatch_if_exists(dir.path()), Ok(true)));
     }
 
     #[tokio::test]
@@ -394,7 +419,6 @@ mod tests {
 
         take!(stream, items);
 
-
         // Append doesn't produce a Write event
         // because the symlink target is not watched on linux
         wait_and_append!(file);
@@ -402,6 +426,98 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         is_match!(&items[0], Create, symlink_path);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_watch_symlink_and_target_write_after_create() -> io::Result<()> {
+        let dir = tempdir()?.into_path();
+        let excluded_dir = tempdir()?.into_path();
+
+        let mut w = Watcher::new(DELAY);
+        w.watch(&dir, RecursiveMode::Recursive).unwrap();
+
+        let file_path = &excluded_dir.join("file1.log");
+        let symlink_path = dir.join("symlink.log");
+        let mut file = File::create(&file_path)?;
+        std::os::unix::fs::symlink(&file_path, &symlink_path)?;
+
+        let stream = w.receive();
+        pin_mut!(stream);
+
+        let mut items = Vec::new();
+        take!(stream, items);
+
+        assert!(!items.is_empty());
+        is_match!(&items[0], Create, symlink_path);
+
+        // Add a watch manually
+        let link_target = std::fs::read_link(&symlink_path)?;
+        w.watch(&link_target, RecursiveMode::NonRecursive).unwrap();
+
+        wait_and_append!(file);
+
+        let stream = w.receive();
+        pin_mut!(stream);
+
+        take!(stream, items);
+
+        wait_and_append!(file);
+        take!(stream, items);
+
+        std::fs::remove_file(&symlink_path)?;
+        take!(stream, items);
+
+        let predicate_fn = predicate::in_iter(items);
+        // Changes are yielded directly to the target file
+        assert!(predicate_fn.eval(&Event::Write(link_target.clone())));
+        // The symlink was removed
+        assert!(predicate_fn.eval(&Event::Remove(symlink_path.clone())));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_watch_symlink_and_target_changed() -> io::Result<()> {
+        let dir = tempdir()?.into_path();
+        let excluded_dir = tempdir()?.into_path();
+
+        let mut w = Watcher::new(DELAY);
+        w.watch(&dir, RecursiveMode::Recursive).unwrap();
+
+        let file_path = &excluded_dir.join("file1.log");
+        let symlink_path = dir.join("symlink.log");
+        let mut file = File::create(&file_path)?;
+        std::os::unix::fs::symlink(&file_path, &symlink_path)?;
+        let mut items = Vec::new();
+
+        // Add a watch manually
+        let link_target = std::fs::read_link(&symlink_path)?;
+        w.watch(&link_target, RecursiveMode::NonRecursive).unwrap();
+
+        wait_and_append!(file);
+
+        let stream = w.receive();
+        pin_mut!(stream);
+        take!(stream, items);
+
+        tokio::time::sleep(DELAY).await;
+        tokio::time::sleep(DELAY).await;
+
+        let file_new_path = &excluded_dir.join("file_new.log");
+        File::create(&file_new_path)?;
+        std::fs::remove_file(&symlink_path)?;
+        std::os::unix::fs::symlink(&file_new_path, &symlink_path)?;
+
+        let mut items = Vec::new();
+        take!(stream, items);
+
+        let predicate_fn = predicate::in_iter(items);
+        // The symlink was edited: yielded as a write in the symlink path
+        assert!(predicate_fn.eval(&Event::Write(symlink_path.clone())));
 
         Ok(())
     }
@@ -425,20 +541,40 @@ mod tests {
 
         let mut items = Vec::new();
         take!(stream, items);
+        let sub_dir_path = &excluded_dir.join("subdir");
+        std::fs::create_dir(sub_dir_path)?;
 
         wait_and_append!(file1);
         take!(stream, items);
 
         let file2_path = &excluded_dir.join("file2.log");
         let mut file2 = File::create(&file2_path)?;
+        let file_in_subdir_path = &sub_dir_path.join("file_in_subdir.log");
+        let mut file_in_subdir = File::create(&file_in_subdir_path)?;
         wait_and_append!(file2);
+        wait_and_append!(file_in_subdir);
         take!(stream, items);
 
         let predicate_fn = predicate::in_iter(items);
 
-        // The file name is yielded as a child of the symlink dir
-        assert!(predicate_fn.eval(&Event::Write(symlink_path.join(file1_path.file_name().unwrap()))));
-        assert!(predicate_fn.eval(&Event::Create(symlink_path.join(file2_path.file_name().unwrap()))));
+        // The file names are yielded as a child of the symlink dir
+        assert!(predicate_fn.eval(&Event::Create(
+            symlink_path.join(file2_path.file_name().unwrap())
+        )));
+        assert!(predicate_fn.eval(&Event::Write(
+            symlink_path.join(file1_path.file_name().unwrap())
+        )));
+        assert!(predicate_fn.eval(&Event::Create(
+            symlink_path.join(sub_dir_path.file_name().unwrap())
+        )));
+
+        let sub_dir_in_symlink = symlink_path.join(sub_dir_path.file_name().unwrap());
+        assert!(predicate_fn.eval(&Event::Create(sub_dir_in_symlink.clone())));
+        // Expected to be "symlink-dir/subdir/file_in_subdir.log"
+        assert!(predicate_fn.eval(&Event::Create(
+            sub_dir_in_symlink.join(file_in_subdir_path.file_name().unwrap())
+        )));
+
         Ok(())
     }
 
