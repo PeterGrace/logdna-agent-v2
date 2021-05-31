@@ -636,10 +636,11 @@ mod tests {
         w.unwatch_if_exists(&symlink_child_file1).unwrap();
         w.unwatch_if_exists(&symlink_child_file2).unwrap();
 
-        // Take all previous events (it might include Error(Io))
+        // Discard all previous events (it might include Error(Io))
         let mut items = Vec::new();
         take!(stream, items);
 
+        // Verify no errors are produced even if target file changes
         tokio::time::sleep(DELAY * 2).await;
         let mut items = Vec::new();
         wait_and_append!(file1);

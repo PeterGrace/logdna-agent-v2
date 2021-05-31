@@ -713,6 +713,7 @@ dependencies = [
  "notify_stream",
  "pcre2",
  "pin-project-lite",
+ "pin-utils",
  "serde_json",
  "slotmap",
  "smallvec",
@@ -1686,6 +1687,7 @@ dependencies = [
  "futures",
  "notify",
  "pin-utils",
+ "predicates",
  "tempfile",
  "tokio",
 ]

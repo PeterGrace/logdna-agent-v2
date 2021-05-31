@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 
 use crate::cache::{Children, EntryKey};
 use crate::cache::{TailedFile, WatchDescriptor};
@@ -12,6 +12,7 @@ use crate::cache::tailed_file::LazyLineSerializer;
 pub enum Entry {
     File {
         name: OsString,
+        //TODO: Define whether `parent` is needed
         parent: EntryKey,
         wd: WatchDescriptor,
         data: RefCell<TailedFile<LazyLineSerializer>>,
@@ -25,6 +26,7 @@ pub enum Entry {
     Symlink {
         name: OsString,
         parent: EntryKey,
+        /// The target of the symlink
         link: PathBuf,
         wd: WatchDescriptor,
         rules: Rules,
@@ -37,6 +39,12 @@ impl Entry {
             Entry::File { name, .. } | Entry::Dir { name, .. } | Entry::Symlink { name, .. } => {
                 name
             }
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Entry::Dir { wd, .. } | Entry::Symlink { wd, .. } | Entry::File { wd, .. } => wd,
         }
     }
 

@@ -200,6 +200,7 @@ impl Tailer {
                         );
 
                         let entries = &fs.entries.borrow();
+                        //TODO: Use entries.get(final_target)?.path() instead
                         let path = fs
                             .resolve_direct_path(entries.get(final_target)?, &fs.entries.borrow());
 
@@ -303,9 +304,7 @@ impl Tailer {
     }
 
     /// Runs the main logic of the tailer, this can only be run once so Tailer is consumed
-    pub fn process<'a>(
-        &mut self,
-    ) -> impl Stream<Item = LazyLineSerializer> + 'a {
+    pub fn process<'a>(&mut self) -> impl Stream<Item = LazyLineSerializer> + 'a {
         let events = FileSystem::stream_events(self.fs_cache.clone());
 
         debug!("Tailer starting with lookback: {:?}", self.lookback_config);
