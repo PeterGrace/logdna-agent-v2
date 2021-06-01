@@ -15,6 +15,7 @@ use futures::{Stream, StreamExt};
 
 use std::fmt;
 use thiserror::Error;
+use std::time::Duration;
 
 #[derive(Clone, std::fmt::Debug, PartialEq)]
 pub enum Lookback {
@@ -28,6 +29,9 @@ pub enum ParseLookbackError {
     #[error("Unknown lookback strategy: {0}")]
     Unknown(String),
 }
+
+/// Debounce filesystem event with a delay of hundreds of milliseconds
+static EVENT_DELAY: Duration = Duration::from_millis(500);
 
 impl std::str::FromStr for Lookback {
     type Err = ParseLookbackError;
@@ -84,7 +88,7 @@ impl Tailer {
     ) -> Self {
         Self {
             lookback_config,
-            fs_cache: Arc::new(Mutex::new(FileSystem::new(watched_dirs, rules))),
+            fs_cache: Arc::new(Mutex::new(FileSystem::new(watched_dirs, rules, EVENT_DELAY))),
             initial_offsets,
         }
     }
@@ -168,7 +172,7 @@ impl Tailer {
                 // will initiate a file to it's current length
                 let entries = fs.entries.borrow();
                 let entry = entries.get(entry_ptr)?;
-                let path = fs.resolve_direct_path(&entry, &fs.entries.borrow());
+                let path = entry.path().to_path_buf();
                 match entry {
                     Entry::File { name, data, .. } => {
                         // If the file's passes the rules tail it
@@ -233,13 +237,10 @@ impl Tailer {
                 // similar to initiate but sets the offset to 0
                 let entries = fs.entries.borrow();
                 let entry = entries.get(entry_ptr)?;
-                let paths = fs.resolve_valid_paths(&entry, &entries);
-                if paths.is_empty() {
-                    return None;
-                }
+                let path = entry.path().to_path_buf();
                 if let Entry::File { data, .. } = entry {
-                    info!("added {:?}", paths[0]);
-                    return data.borrow_mut().tail(paths.clone()).await;
+                    info!("added {:?}", path);
+                    return data.borrow_mut().tail(vec![path]).await;
                 }
             }
             Event::Write(entry_ptr) => {
@@ -247,13 +248,10 @@ impl Tailer {
                 debug!("Write Event");
                 let entries = fs.entries.borrow();
                 let entry = entries.get(entry_ptr)?;
-                let paths = fs.resolve_valid_paths(&entry, &entries);
-                if paths.is_empty() {
-                    return None;
-                }
+                let path = entry.path().to_path_buf();
 
                 if let Entry::File { data, .. } = entry {
-                    return data.borrow_mut().deref_mut().tail(paths).await;
+                    return data.borrow_mut().deref_mut().tail(vec![path]).await;
                 }
             }
             Event::Delete(entry_ptr) => {
