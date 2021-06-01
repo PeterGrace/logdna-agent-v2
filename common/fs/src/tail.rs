@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use futures::{Stream, StreamExt};
 
 use std::fmt;
-use thiserror::Error;
 use std::time::Duration;
+use thiserror::Error;
 
 #[derive(Clone, std::fmt::Debug, PartialEq)]
 pub enum Lookback {
@@ -88,7 +88,11 @@ impl Tailer {
     ) -> Self {
         Self {
             lookback_config,
-            fs_cache: Arc::new(Mutex::new(FileSystem::new(watched_dirs, rules, EVENT_DELAY))),
+            fs_cache: Arc::new(Mutex::new(FileSystem::new(
+                watched_dirs,
+                rules,
+                EVENT_DELAY,
+            ))),
             initial_offsets,
         }
     }

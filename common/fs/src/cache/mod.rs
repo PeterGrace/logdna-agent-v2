@@ -5,14 +5,13 @@ use crate::rule::{GlobRule, Rules, Status};
 use notify_stream::{Event as WatchEvent, RecursiveMode, Watcher};
 
 use std::cell::RefCell;
-use std::ffi::{OsStr, OsString};
-use std::fs::read_dir;
+use std::ffi::OsString;
 use std::iter::FromIterator;
 use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::{fmt, io, fs};
+use std::{fmt, fs, io};
 
 use futures::{Stream, StreamExt};
 use slotmap::{DefaultKey, SlotMap};
@@ -111,8 +110,6 @@ impl FileSystem {
         let entries = fs.entries.clone();
         let mut entries = entries.borrow_mut();
 
-        eprintln!("--Initial dirs: {:?}", initial_dirs);
-
         let mut initial_dirs_events = Vec::new();
         for dir in initial_dirs
             .into_iter()
@@ -135,8 +132,6 @@ impl FileSystem {
                 );
             }
         }
-
-        eprintln!("--Initial dir events: {}", initial_dirs_events.len());
 
         for event in initial_dirs_events {
             match event {
@@ -198,31 +193,23 @@ impl FileSystem {
             WatchEvent::Create(wd) => self.process_create(&wd, events, &mut _entries),
             //TODO: Handle Write event for directories
             WatchEvent::Write(wd) => self.process_modify(&wd, events),
-            WatchEvent::Remove(wd) => {
-                self.process_delete(&wd, OsString::new(), events, &mut _entries)
-            }
+            WatchEvent::Remove(wd) => self.process_delete(&wd, events, &mut _entries),
             WatchEvent::Rename(from_wd, to_wd) => {
-                // directories can't have hard links so we can expect just one entry for these watch
-                // descriptors
-                let from_name = OsString::new();
-                let to_name = OsString::new();
-
+                // Source path should exist and be tracked to be a move
                 let is_from_path_ok = self
                     .get_first_entry(&from_wd)
-                    .map(|entry| self.entry_path_passes(entry, &from_name, &_entries))
+                    .map(|entry| self.entry_path_passes(entry, &_entries))
                     .unwrap_or(false);
 
-                let is_to_path_ok = self
-                    .get_first_entry(&to_wd)
-                    .map(|entry| self.entry_path_passes(entry, &to_name, &_entries))
-                    .unwrap_or(false);
+                // Target path pass the inclusion/exclusion rules to be a move
+                let is_to_path_ok = self.passes(&to_wd, &_entries);
 
                 if is_to_path_ok && is_from_path_ok {
-                    self.process_move(&from_wd, from_name, &to_wd, to_name, events, &mut _entries)
+                    self.process_move(&from_wd, &to_wd, events, &mut _entries)
                 } else if is_to_path_ok {
                     self.process_create(&to_wd, events, &mut _entries)
                 } else if is_from_path_ok {
-                    self.process_delete(&from_wd, from_name, events, &mut _entries)
+                    self.process_delete(&from_wd, events, &mut _entries)
                 } else {
                     // Most likely parent was removed, dropping all child watch descriptors
                     // and we've got the child watch event already queued up
@@ -267,22 +254,8 @@ impl FileSystem {
     ) -> FsResult<()> {
         let path = &watch_descriptor;
 
-        if let Some(new_entry) = self.insert(&path, events, _entries)? {
-            let mut errors = vec![];
-            if matches!(_entries.get(new_entry), Some(_)) {
-                for new_path in recursive_scan(&path) {
-                    if let Err(e) = self.insert(&new_path, events, _entries) {
-                        errors.push(e);
-                    }
-                }
-            };
-
-            if !errors.is_empty() {
-                return Err(Error::InsertRecursively(errors));
-            }
-        }
-
-        Ok(())
+        //TODO: Check duplicates
+        self.insert_new(&path, events, _entries).map(|_| ())
     }
 
     fn process_modify(
@@ -290,7 +263,6 @@ impl FileSystem {
         watch_descriptor: &WatchDescriptor,
         events: &mut Vec<Event>,
     ) -> FsResult<()> {
-        eprintln!("---- Process modify {:?}", watch_descriptor);
         let mut entry_ptrs_opt = None;
         if let Some(entries) = self.watch_descriptors.get_mut(watch_descriptor) {
             entry_ptrs_opt = Some(entries.clone())
@@ -310,16 +282,12 @@ impl FileSystem {
     fn process_delete(
         &mut self,
         watch_descriptor: &WatchDescriptor,
-        name: OsString,
         events: &mut Vec<Event>,
         _entries: &mut EntryMap,
     ) -> FsResult<()> {
-        // directories can't be a hard link so we're guaranteed the watch descriptor maps to one
-        // entry
         let entry_key = self.get_first_entry(watch_descriptor)?;
         let entry = _entries.get(entry_key).ok_or(Error::Lookup)?;
-        let mut path = self.resolve_direct_path(&entry, _entries);
-        path.push(name);
+        let path = entry.path().to_path_buf();
         if !self.initial_dirs.iter().any(|dir| dir.as_ref() == path) {
             self.remove(&path, events, _entries)
         } else {
@@ -330,22 +298,21 @@ impl FileSystem {
     fn process_move(
         &mut self,
         from_watch_descriptor: &WatchDescriptor,
-        from_name: OsString,
         to_watch_descriptor: &WatchDescriptor,
-        to_name: OsString,
         events: &mut Vec<Event>,
         _entries: &mut EntryMap,
     ) -> FsResult<()> {
         let from_entry_key = self.get_first_entry(from_watch_descriptor)?;
         let to_entry_key = self.get_first_entry(to_watch_descriptor)?;
 
-        let from_entry = _entries.get(from_entry_key).ok_or(Error::Lookup)?;
-        let to_entry = _entries.get(to_entry_key).ok_or(Error::Lookup)?;
-
-        let mut from_path = self.resolve_direct_path(&from_entry, _entries);
-        from_path.push(from_name);
-        let mut to_path = self.resolve_direct_path(&to_entry, _entries);
-        to_path.push(to_name);
+        let from_path = _entries
+            .get(from_entry_key)
+            .map(|e| e.path().to_path_buf())
+            .ok_or(Error::Lookup)?;
+        let to_path = _entries
+            .get(to_entry_key)
+            .map(|e| e.path().to_path_buf())
+            .ok_or(Error::Lookup)?;
 
         // the entry is expected to exist
         self.rename(&from_path, &to_path, events, _entries)
@@ -449,19 +416,28 @@ impl FileSystem {
             return Ok(None);
         }
 
-        if fs::metadata(path).map_err(|_| Error::PathNotValid(path.into()))?.is_dir() {
+        if fs::metadata(path)
+            .map_err(|_| Error::PathNotValid(path.into()))?
+            .is_dir()
+        {
             // Watch recursively
-            let contents = fs::read_dir(path).map_err(|e| Error::DirectoryListNotValid(e, path.into()))?;
+            let contents =
+                fs::read_dir(path).map_err(|e| Error::DirectoryListNotValid(e, path.into()))?;
             // Insert the parent directory first
             trace!("inserting directory {}", path.display());
             let new_entry = Entry::Dir {
-                name: path.file_name().ok_or_else(|| Error::PathNotValid(path.into()))?.to_owned(),
+                name: path
+                    .file_name()
+                    .ok_or_else(|| Error::PathNotValid(path.into()))?
+                    .to_owned(),
                 parent: Some(EntryKey::default()),
                 children: Default::default(),
                 wd: path.into(),
             };
 
-            self.watcher.watch(&path, RecursiveMode::NonRecursive).map_err(|e| Error::Watch(path.to_path_buf(), e))?;
+            self.watcher
+                .watch(&path, RecursiveMode::NonRecursive)
+                .map_err(|e| Error::Watch(path.to_path_buf(), e))?;
             let new_key = self.register_as_child_new(new_entry, _entries)?;
             events.push(Event::New(new_key));
 
@@ -471,7 +447,10 @@ impl FileSystem {
                 }
                 let dir_entry = dir_entry.unwrap();
                 if let Err(e) = self.insert_new(&dir_entry.path(), events, _entries) {
-                    info!("Error found when inserting child entry for {:?}: {:?}", path, e);
+                    info!(
+                        "Error found when inserting child entry for {:?}: {:?}",
+                        path, e
+                    );
                 }
             }
             return Ok(Some(new_key));
@@ -479,20 +458,30 @@ impl FileSystem {
 
         let new_entry = match fs::read_link(path) {
             Ok(target) => {
-                trace!("inserting symlink {} with target {}", path.display(), target.display());
+                trace!(
+                    "inserting symlink {} with target {}",
+                    path.display(),
+                    target.display()
+                );
                 Entry::Symlink {
-                    name: path.file_name().ok_or_else(|| Error::PathNotValid(path.into()))?.to_owned(),
+                    name: path
+                        .file_name()
+                        .ok_or_else(|| Error::PathNotValid(path.into()))?
+                        .to_owned(),
                     parent: EntryKey::default(),
                     link: target, //TODO: Resolve nested
                     wd: path.into(),
-                    rules: Default::default()
+                    rules: Default::default(),
                 }
             }
             _ => {
                 trace!("inserting file {}", path.display());
                 Metrics::fs().increment_tracked_files();
                 Entry::File {
-                    name: path.file_name().ok_or_else(|| Error::PathNotValid(path.into()))?.to_owned(),
+                    name: path
+                        .file_name()
+                        .ok_or_else(|| Error::PathNotValid(path.into()))?
+                        .to_owned(),
                     parent: EntryKey::default(),
                     wd: path.into(),
                     data: RefCell::new(TailedFile::new(path).map_err(Error::File)?),
@@ -500,7 +489,9 @@ impl FileSystem {
             }
         };
 
-        self.watcher.watch(&path, RecursiveMode::NonRecursive).map_err(|e| Error::Watch(path.to_path_buf(), e))?;
+        self.watcher
+            .watch(&path, RecursiveMode::NonRecursive)
+            .map_err(|e| Error::Watch(path.to_path_buf(), e))?;
         // TODO: Maybe change method abstractions
         let new_key = self.register_as_child_new(new_entry, _entries)?;
         events.push(Event::New(new_key));
@@ -955,7 +946,7 @@ impl FileSystem {
                     HashMapEntry::Vacant(v) => Ok(*v.insert(new_key)),
                     // TODO: Maybe consider to silently replace
                     _ => Err(Error::Existing),
-                }
+                };
             } else {
                 trace!("Parent with path {:?} not found", parent_path);
             }
@@ -1040,14 +1031,11 @@ impl FileSystem {
         self.is_initial_dir_target(path) || self.is_symlink_target(path, _entries)
     }
 
-    fn entry_path_passes(&self, entry: EntryKey, name: &OsStr, _entries: &EntryMap) -> bool {
-        if let Some(entry_ref) = _entries.get(entry) {
-            let mut path = self.resolve_direct_path(&entry_ref, &_entries);
-            path.push(name);
-            self.passes(&path, &_entries)
-        } else {
-            false
-        }
+    fn entry_path_passes(&self, entry_key: EntryKey, entries: &EntryMap) -> bool {
+        entries
+            .get(entry_key)
+            .map(|e| self.passes(e.path(), &entries))
+            .unwrap_or(false)
     }
 
     /// Returns the first entry based on the `WatchDescriptor`, returning an `Err` when not found.
@@ -1077,43 +1065,6 @@ impl fmt::Debug for FileSystem {
         builder.field("initial_events", &&self.initial_events);
         builder.finish()
     }
-}
-
-// recursively scans a directory for unlimited depth
-fn recursive_scan(path: &Path) -> Vec<PathBuf> {
-    if !path.is_dir() {
-        return vec![];
-    }
-
-    let mut paths = vec![path.to_path_buf()];
-
-    // read all files/dirs in path at depth 1
-    let tmp_paths = match read_dir(&path) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("failed accessing {:?}: {:?}", path, e);
-            return paths;
-        }
-    };
-    // iterate over all the paths and call recursive_scan on all dirs
-    for tmp_path in tmp_paths {
-        let path = match tmp_path {
-            Ok(path) => path.path(),
-            Err(e) => {
-                error!("failed scanning directory {:?}: {:?}", path, e);
-                continue;
-            }
-        };
-        // if the path is a dir then recursively scan it also
-        // so that we have an unlimited depth scan
-        if path.is_dir() {
-            paths.append(&mut recursive_scan(&path))
-        } else {
-            paths.push(path)
-        }
-    }
-
-    paths
 }
 
 // Split the path into it's components.
@@ -1162,7 +1113,7 @@ mod tests {
     use std::fs::{copy, create_dir, hard_link, remove_dir_all, remove_file, rename, File};
     use std::os::unix::fs::symlink;
     use std::{io, panic};
-    use tempfile::{TempDir, tempdir};
+    use tempfile::{tempdir, TempDir};
 
     static DELAY: Duration = Duration::from_millis(200);
 
@@ -1181,22 +1132,9 @@ mod tests {
         }};
     }
 
-    macro_rules! take_events2 {
-        ( $x:expr, $y: expr ) => {{
-            use tokio_stream::StreamExt;
-
-            futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::take(
-                FileSystem::stream_events($x.clone())
-                    .timeout(std::time::Duration::from_millis(500)),
-                $y,
-            ))
-            .await
-        }};
-    }
-
     macro_rules! take {
         ($x: expr) => {
-            tokio::time::sleep(DELAY).await;
+            tokio::time::sleep(DELAY * 2).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
             let stream = FileSystem::stream_events($x.clone());
             pin_mut!(stream);
@@ -1229,7 +1167,10 @@ mod tests {
             {
                 let fs = $x.lock().expect("couldn't lock fs");
                 let entries = fs.entries.borrow();
-                assert!(matches!(entries.get($y.unwrap()).unwrap().deref(), Entry::File { .. }));
+                assert!(matches!(
+                    entries.get($y.unwrap()).unwrap().deref(),
+                    Entry::File { .. }
+                ));
             }
         };
     }
@@ -1296,70 +1237,37 @@ mod tests {
     #[tokio::test]
     async fn filesystem_rotate_create_move() {
         let _ = env_logger::Builder::from_default_env().try_init();
-        // TODO: Use small delay
-        let tempdir = TempDir::new().unwrap().into_path();
-        let path = tempdir;
-        // let path = tempdir.path().to_path_buf();
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path();
 
-        let fs = Arc::new(Mutex::new(new_fs::<()>(path.clone(), None)));
+        let fs = create_fs(path);
 
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let a = path.join("a");
-        eprintln!("--Creating");
         File::create(&a).unwrap();
 
-        eprintln!("--taking events");
         take!(fs);
-        eprintln!("--looking entry");
-        let entry = lookup_entry!(fs, a);
+        let entry_key = lookup!(fs, a);
+        assert_is_file!(fs, entry_key);
 
-        eprintln!("--asserting 1");
-        assert!(entry.is_some());
-        {
-            let _fs = fs.lock().expect("couldn't lock fs");
-            let _entries = &_fs.entries;
-            let _entries = _entries.borrow();
-            match _entries.get(entry.unwrap()).unwrap().deref() {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            };
-        }
-        eprintln!("--renaming");
-
-        let old = path.join("a.old");
-        rename(&a, &old).unwrap();
+        let new = path.join("a.new");
+        rename(&a, &new).unwrap();
 
         take!(fs);
 
-        let entry = lookup_entry!(fs, a);
-        assert!(entry.is_none());
+        // Previous name should not have an associated entry
+        let entry_key = lookup!(fs, a);
+        assert!(entry_key.is_none());
 
-        let entry = lookup_entry!(fs, old);
-        assert!(entry.is_some());
-        {
-            let _fs = fs.lock().expect("couldn't lock fs");
-            let _entries = &_fs.entries;
-            let _entries = _entries.borrow();
-            match _entries.get(entry.unwrap()).unwrap().deref() {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            };
-        }
+        let entry_key = lookup!(fs, new);
+        assert_is_file!(fs, entry_key);
+
+        // Create a new file in place
         File::create(&a).unwrap();
 
-        take_events2!(fs, 1);
-
-        let entry = lookup_entry!(fs, a);
-        assert!(entry.is_some());
-        {
-            let _fs = fs.lock().expect("couldn't lock fs");
-            let _entries = &_fs.entries;
-            let _entries = _entries.borrow();
-            match _entries.get(entry.unwrap()).unwrap().deref() {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            };
-        }
+        take!(fs);
+        let entry_key = lookup!(fs, a);
+        assert_is_file!(fs, entry_key);
     }
 
     // Simulates the `create_copy` log rotation strategy
