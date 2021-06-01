@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::process::Command;
-use std::thread::{self, sleep};
+use std::thread;
 use std::time::Duration;
 use wait_timeout::ChildExt;
 
@@ -15,7 +15,6 @@ use hyper::{Client, StatusCode};
 use log::debug;
 use predicates::prelude::*;
 use proptest::prelude::*;
-use systemd::journal;
 use tempfile::tempdir;
 use test_types::random_line_string_vec;
 use tokio::task;
@@ -638,10 +637,12 @@ fn test_directory_symlinks_delete() {
 
 #[tokio::test]
 #[cfg_attr(not(feature = "integration_tests"), ignore)]
-#[cfg_attr(not(target_os = "linux"), ignore)]
+#[cfg(target_os = "linux")]
 async fn test_journald_support() {
+    use systemd::journal;
+
     assert_eq!(journal::print(6, "Sample info"), 0);
-    sleep(Duration::from_millis(1000));
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let dir = "/var/log/journal";
     let (server, received, shutdown_handle, addr) = common::start_http_ingester();
     let mut settings = AgentSettings::with_mock_ingester("/var/log/journal", &addr);
@@ -659,7 +660,7 @@ async fn test_journald_support() {
         }
 
         // Wait for the data to be received by the mock ingester
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let map = received.lock().await;
         let file_info = map.values().next().unwrap();
