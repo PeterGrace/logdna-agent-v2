@@ -636,12 +636,10 @@ fn test_directory_symlinks_delete() {
 }
 
 #[tokio::test]
-#[cfg_attr(not(feature = "integration_tests"), ignore)]
+#[cfg(feature = "integration_tests")]
 #[cfg(target_os = "linux")]
 async fn test_journald_support() {
-    use systemd::journal;
-
-    assert_eq!(journal::print(6, "Sample info"), 0);
+    assert_eq!(systemd::journal::print(6, "Sample info"), 0);
     tokio::time::sleep(Duration::from_millis(500)).await;
     let dir = "/var/log/journal";
     let (server, received, shutdown_handle, addr) = common::start_http_ingester();
@@ -655,8 +653,8 @@ async fn test_journald_support() {
 
     let (server_result, _) = tokio::join!(server, async {
         for _ in 0..10 {
-            journal::print(1, "Sample alert");
-            journal::print(6, "Sample info");
+            systemd::journal::print(1, "Sample alert");
+            systemd::journal::print(6, "Sample info");
         }
 
         // Wait for the data to be received by the mock ingester

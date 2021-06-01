@@ -46,8 +46,9 @@ pin-utils = "0.1"
 auditable = "0.1"
 miniz_oxide = "0.4"
 
-# Optional dependency for integration tests
-systemd = { package = "systemd", version = "0.7", optional = true}
+# Dependency for linux integration tests
+[target.'cfg(target_os="linux")'.dependencies]
+systemd = { package = "systemd", version = "0.7" }
 
 [features]
 default = ["libjournald"]
