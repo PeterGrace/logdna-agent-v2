@@ -6,7 +6,6 @@ use notify_stream::{Event as WatchEvent, RecursiveMode, Watcher};
 
 use std::cell::RefCell;
 use std::ffi::OsString;
-use std::iter::FromIterator;
 use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -123,7 +122,7 @@ impl FileSystem {
                     break;
                 }
             }
-            if let Err(e) = fs.insert_new(&path_cpy, &mut initial_dirs_events, &mut entries) {
+            if let Err(e) = fs.insert(&path_cpy, &mut initial_dirs_events, &mut entries) {
                 // It can failed due to permissions or some other restriction
                 debug!(
                     "Initial insertion of {} failed: {}",
@@ -255,7 +254,7 @@ impl FileSystem {
         let path = &watch_descriptor;
 
         //TODO: Check duplicates
-        self.insert_new(&path, events, _entries).map(|_| ())
+        self.insert(&path, events, _entries).map(|_| ())
     }
 
     fn process_modify(
@@ -376,7 +375,7 @@ impl FileSystem {
     /// When the path doesn't pass the rules or the path is invalid, it returns `Ok(None)`.
     /// When the file watcher can't be added or the parent dir can not be created, it
     /// returns an `Err`.
-    fn insert_new(
+    fn insert(
         &mut self,
         path: &Path,
         events: &mut Vec<Event>,
@@ -414,7 +413,7 @@ impl FileSystem {
             self.watcher
                 .watch(&path, RecursiveMode::NonRecursive)
                 .map_err(|e| Error::Watch(path.to_path_buf(), e))?;
-            let new_key = self.register_as_child_new(new_entry, _entries)?;
+            let new_key = self.register_as_child(new_entry, _entries)?;
             events.push(Event::New(new_key));
 
             for dir_entry in contents {
@@ -422,7 +421,7 @@ impl FileSystem {
                     continue;
                 }
                 let dir_entry = dir_entry.unwrap();
-                if let Err(e) = self.insert_new(&dir_entry.path(), events, _entries) {
+                if let Err(e) = self.insert(&dir_entry.path(), events, _entries) {
                     info!(
                         "Error found when inserting child entry for {:?}: {:?}",
                         path, e
@@ -469,145 +468,12 @@ impl FileSystem {
             .watch(&path, RecursiveMode::NonRecursive)
             .map_err(|e| Error::Watch(path.to_path_buf(), e))?;
         // TODO: Maybe change method abstractions
-        let new_key = self.register_as_child_new(new_entry, _entries)?;
+        let new_key = self.register_as_child(new_entry, _entries)?;
         events.push(Event::New(new_key));
         Ok(Some(new_key))
     }
 
-    /// Inserts a new entry when the path validates the inclusion/exclusion rules.
-    ///
-    /// Returns `Ok(Some(entry))` pointing to the newly created entry.
-    ///
-    /// When the path doesn't pass the rules or the path is invalid, it returns `Ok(None)`.
-    /// When the file watcher can't be added or the parent dir can not be created, it
-    /// returns an `Err`.
-    fn insert(
-        &mut self,
-        path: &Path,
-        events: &mut Vec<Event>,
-        _entries: &mut EntryMap,
-    ) -> FsResult<Option<EntryKey>> {
-        if !self.passes(path, _entries) {
-            info!("ignoring {:?}", path);
-            return Ok(None);
-        }
-
-        if !(path.exists() || path.read_link().is_ok()) {
-            warn!("attempted to insert non existent path {:?}", path);
-            return Ok(None);
-        }
-
-        let parent_ref = self.create_dir(&path.parent().unwrap(), _entries)?;
-        let parent_ref = self.follow_links(parent_ref, _entries);
-
-        if parent_ref.is_none() {
-            return Ok(None);
-        }
-
-        let parent_ref = parent_ref.unwrap();
-
-        // We only need the last component, the parents are already inserted.
-        let component = into_components(path)
-            .pop()
-            .ok_or_else(|| Error::PathNotValid(path.into()))?;
-
-        // If the path is a dir, we can use create_dir to do the insert
-        if path.is_dir() {
-            return self.create_dir(path, _entries).map(Some);
-        }
-
-        enum Action {
-            Return(EntryKey),
-            CreateSymlink(PathBuf),
-            CreateFile,
-        }
-
-        let parent = _entries.get_mut(parent_ref).ok_or(Error::Lookup)?;
-        let action = match parent
-            .children_mut()
-            .ok_or(Error::ParentNotValid)?
-            .entry(component.clone())
-        {
-            HashMapEntry::Occupied(v) => Action::Return(*v.get()),
-            HashMapEntry::Vacant(_) => match path.read_link() {
-                Ok(real) => Action::CreateSymlink(real),
-                Err(_) => Action::CreateFile,
-            },
-        };
-
-        match action {
-            Action::Return(key) => Ok(Some(key)),
-            Action::CreateFile => {
-                self.watcher
-                    .watch(path, RecursiveMode::Recursive)
-                    .map_err(|e| Error::Watch(path.to_owned(), e))?;
-
-                let new_entry = Entry::File {
-                    name: component,
-                    parent: parent_ref,
-                    wd: path.into(),
-                    data: RefCell::new(TailedFile::new(path).map_err(Error::File)?),
-                };
-
-                Metrics::fs().increment_tracked_files();
-
-                let new_key = self.register_as_child(parent_ref, new_entry, _entries)?;
-                events.push(Event::New(new_key));
-                Ok(Some(new_key))
-            }
-            Action::CreateSymlink(real) => {
-                self.watcher
-                    .watch(path, RecursiveMode::Recursive)
-                    .map_err(|e| Error::Watch(path.to_owned(), e))?;
-
-                let new_entry = Entry::Symlink {
-                    name: component,
-                    parent: parent_ref,
-                    link: real.clone(),
-                    wd: path.into(),
-                    rules: into_rules(real.clone()),
-                };
-
-                let new_key = self.register_as_child(parent_ref, new_entry, _entries)?;
-
-                if self
-                    .insert(&real, events, _entries)
-                    .unwrap_or(None)
-                    .is_none()
-                {
-                    debug!(
-                        "inserting symlink {:?} which points to invalid path {:?}",
-                        path, real
-                    );
-                }
-
-                events.push(Event::New(new_key));
-                Ok(Some(new_key))
-            }
-        }
-    }
-
-    fn register(&mut self, entry_ptr: EntryKey, _entries: &mut EntryMap) -> FsResult<()> {
-        let entry = _entries.get(entry_ptr).ok_or(Error::Lookup)?;
-        let path = self.resolve_direct_path(&entry, _entries);
-
-        self.watch_descriptors
-            .entry(entry.watch_descriptor().clone())
-            .or_insert_with(Vec::new)
-            .push(entry_ptr);
-
-        if let Entry::Symlink { link, .. } = entry.deref() {
-            self.symlinks
-                .entry(link.clone())
-                .or_insert_with(Vec::new)
-                .push(entry_ptr);
-        }
-
-        info!("watching {:?}", path);
-        Ok(())
-    }
-
-    fn register_new(&mut self, entry_key: EntryKey, _entries: &mut EntryMap) -> FsResult<()> {
+    fn register(&mut self, entry_key: EntryKey, _entries: &mut EntryMap) -> FsResult<()> {
         let entry = _entries.get(entry_key).ok_or(Error::Lookup)?;
         let path = entry.path();
 
@@ -803,117 +669,8 @@ impl FileSystem {
         Ok(())
     }
 
-    // Creates all entries for a directory.
-    // If one of the entries already exists, it is skipped over.
-    // The returns a linked list of all entries.
-    fn create_dir(&mut self, path: &Path, _entries: &mut EntryMap) -> FsResult<EntryKey> {
-        let mut m_entry = self.root;
-
-        let components = into_components(path);
-
-        // If the path has no parents return root as the parent.
-        // This commonly occurs with paths in the filesystem root, e.g /some.file or /somedir
-        if components.is_empty() {
-            return Ok(m_entry);
-        }
-
-        enum Action {
-            Return(EntryKey),
-            Lookup(PathBuf),
-            CreateSymlink(PathBuf),
-            CreateDir,
-        }
-
-        for (i, component) in components.iter().enumerate().skip(1) {
-            let current_path = PathBuf::from_iter(&components[0..=i]);
-
-            let action = match _entries
-                .get_mut(m_entry)
-                .ok_or(Error::ParentLookup)?
-                .children_mut()
-                .ok_or(Error::ParentNotValid)?
-                .entry(component.clone())
-            {
-                HashMapEntry::Occupied(v) => {
-                    let entry_key = *v.get();
-                    let existing_entry = _entries.get(entry_key).ok_or(Error::Lookup)?;
-
-                    match existing_entry.deref() {
-                        Entry::Symlink { link, .. } => Action::Lookup(link.clone()),
-                        _ => Action::Return(entry_key),
-                    }
-                }
-                HashMapEntry::Vacant(_) => match current_path.as_path().read_link() {
-                    Ok(real) => Action::CreateSymlink(real),
-                    Err(_) => Action::CreateDir,
-                },
-            };
-
-            let new_entry = match action {
-                Action::Return(key) => key,
-                Action::Lookup(ref link) => self.lookup(link, _entries).ok_or(Error::Lookup)?,
-                Action::CreateDir => {
-                    self.watcher
-                        .watch(&current_path, RecursiveMode::Recursive)
-                        .map_err(|e| Error::Watch(current_path.to_owned(), e))?;
-
-                    let new_entry = Entry::Dir {
-                        name: component.clone(),
-                        parent: Some(m_entry),
-                        children: HashMap::new(),
-                        wd: current_path,
-                    };
-
-                    self.register_as_child(m_entry, new_entry, _entries)?
-                }
-                Action::CreateSymlink(real) => {
-                    self.watcher
-                        .watch(&current_path, RecursiveMode::Recursive)
-                        .map_err(|e| Error::Watch(current_path.to_owned(), e))?;
-
-                    let new_entry = Entry::Symlink {
-                        name: component.clone(),
-                        parent: m_entry,
-                        link: real.clone(),
-                        wd: current_path,
-                        rules: into_rules(real.clone()),
-                    };
-
-                    self.register_as_child(m_entry, new_entry, _entries)?;
-                    self.create_dir(&real, _entries)?
-                }
-            };
-
-            m_entry = new_entry;
-        }
-        Ok(m_entry)
-    }
-
     /// Inserts the entry, registers it, looks up for the parent and set itself as a children.
     fn register_as_child(
-        &mut self,
-        parent_key: EntryKey,
-        new_entry: Entry,
-        entries: &mut EntryMap,
-    ) -> FsResult<EntryKey> {
-        let component = new_entry.name().clone();
-        let new_key = entries.insert(new_entry);
-        self.register(new_key, entries)?;
-
-        match entries
-            .get_mut(parent_key)
-            .ok_or(Error::ParentLookup)?
-            .children_mut()
-            .ok_or(Error::ParentNotValid)?
-            .entry(component)
-        {
-            HashMapEntry::Vacant(v) => Ok(*v.insert(new_key)),
-            _ => Err(Error::Existing),
-        }
-    }
-
-    /// Inserts the entry, registers it, looks up for the parent and set itself as a children.
-    fn register_as_child_new(
         &mut self,
         new_entry: Entry,
         entries: &mut EntryMap,
@@ -921,7 +678,7 @@ impl FileSystem {
         let component = new_entry.name().clone();
         let parent_path = new_entry.path().parent().map(|p| p.to_path_buf());
         let new_key = entries.insert(new_entry);
-        self.register_new(new_key, entries)?;
+        self.register(new_key, entries)?;
 
         // Try to find parent
         if let Some(parent_path) = parent_path {
@@ -951,24 +708,6 @@ impl FileSystem {
     /// When the path is not represented and therefore has no entry then `None` is return.
     pub fn lookup(&self, path: &Path, _entries: &EntryMap) -> Option<EntryKey> {
         self.watch_descriptors.get(path).map(|entries| entries[0])
-    }
-
-    fn follow_links(&self, entry: EntryKey, _entries: &EntryMap) -> Option<EntryKey> {
-        let mut result = entry;
-        let mut safety_counter = 0;
-        while let Some(e) = _entries.get(result) {
-            if let Some(link) = e.link() {
-                result = self.lookup(link, _entries)?;
-            } else {
-                break;
-            }
-            safety_counter += 1;
-            if safety_counter > 1_000 {
-                error!("recursive lookup took more steps than allowed");
-                return None;
-            }
-        }
-        Some(result)
     }
 
     fn is_symlink_target(&self, path: &Path, _entries: &EntryMap) -> bool {
@@ -1067,13 +806,6 @@ fn into_components(path: &Path) -> Vec<OsString> {
             _ => None,
         })
         .collect()
-}
-
-// Build a rule for all sub paths for a path e.g. /var/log/containers => include [/, /var, /var/log, /var/log/containers]
-fn into_rules(path: PathBuf) -> Rules {
-    let mut rules = Rules::new();
-    append_rules(&mut rules, path);
-    rules
 }
 
 // Attach rules for all sub paths for a path
