@@ -205,7 +205,7 @@ impl FileSystem {
                 let is_to_path_ok = self.passes(&to_wd, &_entries);
 
                 if is_to_path_ok && is_from_path_ok {
-                    self.process_move(&from_wd, &to_wd, events, &mut _entries)
+                    self.process_rename(&from_wd, &to_wd, events, &mut _entries)
                 } else if is_to_path_ok {
                     self.process_create(&to_wd, events, &mut _entries)
                 } else if is_from_path_ok {
@@ -293,30 +293,6 @@ impl FileSystem {
         } else {
             Ok(())
         }
-    }
-
-    fn process_move(
-        &mut self,
-        from_watch_descriptor: &WatchDescriptor,
-        to_watch_descriptor: &WatchDescriptor,
-        events: &mut Vec<Event>,
-        _entries: &mut EntryMap,
-    ) -> FsResult<()> {
-        let from_entry_key = self.get_first_entry(from_watch_descriptor)?;
-        let to_entry_key = self.get_first_entry(to_watch_descriptor)?;
-
-        let from_path = _entries
-            .get(from_entry_key)
-            .map(|e| e.path().to_path_buf())
-            .ok_or(Error::Lookup)?;
-        let to_path = _entries
-            .get(to_entry_key)
-            .map(|e| e.path().to_path_buf())
-            .ok_or(Error::Lookup)?;
-
-        // the entry is expected to exist
-        self.rename(&from_path, &to_path, events, _entries)
-            .map(|_| ())
     }
 
     pub fn resolve_direct_path(&self, entry: &Entry, _entries: &EntryMap) -> PathBuf {
@@ -469,7 +445,7 @@ impl FileSystem {
                         .ok_or_else(|| Error::PathNotValid(path.into()))?
                         .to_owned(),
                     parent: EntryKey::default(),
-                    link: target, //TODO: Resolve nested
+                    link: target,
                     wd: path.into(),
                     rules: Default::default(),
                 }
@@ -651,6 +627,7 @@ impl FileSystem {
         Ok(())
     }
 
+    //TODO: Adapt
     fn unregister(&mut self, entry_ptr: EntryKey, _entries: &mut EntryMap) {
         if let Some(entry) = _entries.get(entry_ptr) {
             let path = self.resolve_direct_path(&entry, _entries);
@@ -771,22 +748,22 @@ impl FileSystem {
     // `from` is the path from where the file or dir used to live
     // `to is the path to where the file or dir now lives
     // e.g from = /var/log/syslog and to = /var/log/syslog.1.log
-    fn rename(
+    fn process_rename(
         &mut self,
-        from: &Path,
-        to: &Path,
+        from_path: &Path,
+        to_path: &Path,
         events: &mut Vec<Event>,
         _entries: &mut EntryMap,
-    ) -> FsResult<Option<EntryKey>> {
-        let parent_path = to.parent().ok_or(Error::ParentNotValid)?;
-        let new_parent = self.create_dir(parent_path, _entries)?;
+    ) -> FsResult<()> {
+        let new_parent = to_path.parent().map(|p| self.lookup(p, _entries)).flatten();
 
-        match self.lookup(from, _entries) {
+        match self.lookup(from_path, _entries) {
             Some(entry_key) => {
                 let entry = _entries.get_mut(entry_key).ok_or(Error::Lookup)?;
-                let new_name = into_components(to)
-                    .pop()
-                    .ok_or_else(|| Error::PathNotValid(to.into()))?;
+                let new_name = to_path
+                    .file_name()
+                    .ok_or_else(|| Error::PathNotValid(to_path.into()))?
+                    .to_owned();
                 let old_name = entry.name().clone();
                 if let Some(parent) = entry.parent() {
                     _entries
@@ -798,18 +775,32 @@ impl FileSystem {
                 }
 
                 let entry = _entries.get_mut(entry_key).ok_or(Error::Lookup)?;
-                entry.set_parent(new_parent);
                 entry.set_name(new_name.clone());
+                entry.set_path(to_path.to_path_buf());
 
-                Ok(_entries
-                    .get_mut(new_parent)
-                    .ok_or(Error::ParentLookup)?
-                    .children_mut()
-                    .ok_or(Error::ParentNotValid)?
-                    .insert(new_name, entry_key))
+                // Remove previous reference and add new one
+                self.watch_descriptors.remove(to_path);
+                self.watch_descriptors
+                    .entry(to_path.to_path_buf())
+                    .or_insert_with(Vec::new)
+                    .push(entry_key);
+
+                if let Some(new_parent) = new_parent {
+                    entry.set_parent(new_parent);
+
+                    _entries
+                        .get_mut(new_parent)
+                        .ok_or(Error::ParentLookup)?
+                        .children_mut()
+                        .ok_or(Error::ParentNotValid)?
+                        .insert(new_name, entry_key);
+                }
             }
-            None => self.insert(to, events, _entries),
+            None => {
+                self.insert(to_path, events, _entries)?;
+            }
         }
+        Ok(())
     }
 
     // Creates all entries for a directory.

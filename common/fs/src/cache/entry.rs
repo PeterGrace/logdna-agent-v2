@@ -48,6 +48,14 @@ impl Entry {
         }
     }
 
+    pub fn set_path(&mut self, path: PathBuf) {
+        match self {
+            Entry::File { wd, .. } | Entry::Dir { wd, .. } | Entry::Symlink { wd, .. } => {
+                *wd = path
+            }
+        }
+    }
+
     pub fn parent(&self) -> Option<EntryKey> {
         match self {
             Entry::File { parent, .. } | Entry::Symlink { parent, .. } => Some(*parent),
