@@ -7,7 +7,7 @@ use notify_stream::{Event as WatchEvent, RecursiveMode, Watcher};
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::ops::Deref;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::{fmt, fs, io};
@@ -294,80 +294,6 @@ impl FileSystem {
         }
     }
 
-    pub fn resolve_direct_path(&self, entry: &Entry, _entries: &EntryMap) -> PathBuf {
-        // TODO: extract these Vecs or replace with SmallVec
-        let mut components = Vec::new();
-
-        let mut name = entry.name().clone();
-        let mut entry_ptr: Option<EntryKey> = entry.parent();
-
-        loop {
-            components.push(name);
-
-            entry_ptr = match entry_ptr {
-                Some(parent_ptr) => match _entries.get(parent_ptr) {
-                    Some(parent_entry) => {
-                        name = parent_entry.name().clone();
-                        parent_entry.parent()
-                    }
-                    None => break,
-                },
-                None => break,
-            }
-        }
-
-        components.reverse();
-        components.into_iter().collect()
-    }
-
-    pub fn resolve_valid_paths(&self, entry: &Entry, _entries: &EntryMap) -> Vec<PathBuf> {
-        // TODO: extract these Vecs or replace with SmallVec
-        let mut paths = Vec::new();
-        self.resolve_valid_paths_helper(entry, &mut paths, Vec::new(), _entries);
-        paths
-    }
-
-    fn resolve_valid_paths_helper(
-        &self,
-        entry: &Entry,
-        paths: &mut Vec<PathBuf>,
-        mut components: Vec<OsString>,
-        _entries: &EntryMap,
-    ) {
-        let mut base_components: Vec<OsString> =
-            into_components(&self.resolve_direct_path(entry, _entries));
-        base_components.append(&mut components); // add components already discovered from previous recursive step
-        let path: PathBuf = base_components.iter().collect();
-        if self.is_initial_dir_target(&path) {
-            // only want paths that fall in our watch window
-            paths.push(path); // condense components of path that lead to the true entry into a PathBuf
-        }
-
-        let raw_components = base_components.as_slice();
-        for i in 0..raw_components.len() - components.len() {
-            // only need to iterate components up to current entry
-            let current_path: PathBuf = raw_components[0..=i].to_vec().into_iter().collect();
-
-            if let Some(symlinks) = self.symlinks.get(&current_path) {
-                // check if path has a symlink to it
-                let symlink_components = raw_components[(i + 1)..].to_vec();
-                for symlink_ptr in symlinks.iter() {
-                    let symlink = _entries.get(*symlink_ptr);
-                    if let Some(symlink) = symlink {
-                        self.resolve_valid_paths_helper(
-                            &symlink,
-                            paths,
-                            symlink_components.clone(),
-                            _entries,
-                        );
-                    } else {
-                        error!("failed to find entry");
-                    }
-                }
-            }
-        }
-    }
-
     /// Inserts a new entry when the path validates the inclusion/exclusion rules.
     ///
     /// Returns `Ok(Some(entry))` pointing to the newly created entry.
@@ -386,7 +312,8 @@ impl FileSystem {
             return Ok(None);
         }
 
-        if !path.exists() && !path.read_link().is_ok() {
+        let link_path = path.read_link();
+        if !path.exists() && !link_path.is_ok() {
             warn!("attempted to insert non existent path {:?}", path);
             return Ok(None);
         }
@@ -405,7 +332,7 @@ impl FileSystem {
                     .file_name()
                     .ok_or_else(|| Error::PathNotValid(path.into()))?
                     .to_owned(),
-                parent: Some(EntryKey::default()),
+                parent: None,
                 children: Default::default(),
                 wd: path.into(),
             };
@@ -431,7 +358,7 @@ impl FileSystem {
             return Ok(Some(new_key));
         }
 
-        let new_entry = match fs::read_link(path) {
+        let new_entry = match link_path {
             Ok(target) => {
                 trace!(
                     "inserting symlink {} with target {}",
@@ -493,51 +420,53 @@ impl FileSystem {
         Ok(())
     }
 
-    //TODO: Adapt
-    fn unregister(&mut self, entry_ptr: EntryKey, _entries: &mut EntryMap) {
-        if let Some(entry) = _entries.get(entry_ptr) {
-            let path = self.resolve_direct_path(&entry, _entries);
+    /// Removes the entry reference from watch_descriptors and symlinks
+    fn unregister(&mut self, entry_key: EntryKey, _entries: &mut EntryMap) {
+        let entry = match _entries.get(entry_key) {
+            Some(v) => v,
+            None => {
+                error!("failed to find entry to unregister");
+                return;
+            }
+        };
 
-            let wd = entry.watch_descriptor().clone();
-            let entries = match self.watch_descriptors.get_mut(&wd) {
+        let path = entry.path().to_path_buf();
+        let entries = match self.watch_descriptors.get_mut(&path) {
+            Some(v) => v,
+            None => {
+                error!("attempted to remove untracked watch descriptor {:?}", path);
+                return;
+            }
+        };
+
+        entries.retain(|other| *other != entry_key);
+        if entries.is_empty() {
+            self.watch_descriptors.remove(&path);
+            if let Err(e) = self.watcher.unwatch_if_exists(&path) {
+                // Log and continue
+                debug!(
+                    "unwatching {:?} resulted in an error, likely due to a dangling symlink {:?}",
+                    path, e
+                );
+            }
+        }
+
+        if let Entry::Symlink { link, .. } = entry.deref() {
+            let entries = match self.symlinks.get_mut(link) {
                 Some(v) => v,
                 None => {
-                    error!("attempted to remove untracked watch descriptor {:?}", wd);
+                    error!("attempted to remove untracked symlink {:?}", path);
                     return;
                 }
             };
 
-            entries.retain(|other| *other != entry_ptr);
+            entries.retain(|other| *other != entry_key);
             if entries.is_empty() {
-                self.watch_descriptors.remove(&wd);
-                if let Err(e) = self.watcher.unwatch(wd) {
-                    // Log and continue
-                    debug!(
-                        "unwatching {:?} resulted in an error, likely due to a dangling symlink {:?}",
-                        path, e
-                    );
-                }
+                self.symlinks.remove(link);
             }
+        }
 
-            if let Entry::Symlink { link, .. } = entry.deref() {
-                let entries = match self.symlinks.get_mut(link) {
-                    Some(v) => v,
-                    None => {
-                        error!("attempted to remove untracked symlink {:?}", path);
-                        return;
-                    }
-                };
-
-                entries.retain(|other| *other != entry_ptr);
-                if entries.is_empty() {
-                    self.symlinks.remove(link);
-                }
-            }
-
-            info!("unwatching {:?}", path);
-        } else {
-            error!("failed to find entry to unregister");
-        };
+        info!("unwatching {:?}", path);
     }
 
     fn remove(
@@ -546,28 +475,31 @@ impl FileSystem {
         events: &mut Vec<Event>,
         _entries: &mut EntryMap,
     ) -> FsResult<()> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| Error::PathNotValid(path.into()))?;
-        let parent = self.lookup(parent, _entries).ok_or(Error::ParentLookup)?;
-        let component = into_components(path)
-            .pop()
-            .ok_or_else(|| Error::PathNotValid(path.into()))?;
+        let entry_key = self.lookup(path, _entries).ok_or(Error::Lookup)?;
+        let parent = path.parent().map(|p| self.lookup(p, _entries)).flatten();
 
-        let to_drop = _entries
-            .get_mut(parent)
-            .ok_or(Error::ParentLookup)?
-            .children_mut()
-            .ok_or(Error::ParentNotValid)?
-            .remove(&component);
-
-        if let Some(entry) = to_drop {
-            self.drop_entry(entry, events, _entries);
+        if let Some(parent) = parent {
+            let name = path
+                .file_name()
+                .ok_or_else(|| Error::PathNotValid(path.to_path_buf()))?;
+            match _entries.get_mut(parent) {
+                None => {}
+                Some(parent_entry) => {
+                    parent_entry
+                        .children_mut()
+                        .ok_or(Error::ParentNotValid)?
+                        .remove(&name.to_owned());
+                }
+            }
         }
+
+        self.drop_entry(entry_key, events, _entries);
 
         Ok(())
     }
 
+    /// Emits `Delete` events, removes the entry and its children from
+    /// watch descriptors and symlinks.
     fn drop_entry(
         &mut self,
         entry_key: EntryKey,
@@ -582,7 +514,6 @@ impl FileSystem {
                 Entry::Dir { children, .. } => {
                     for child in children.values() {
                         _children.push(*child);
-                        //self.drop_entry(*child, events, _entries);
                     }
                 }
                 Entry::Symlink { ref link, .. } => {
@@ -631,6 +562,7 @@ impl FileSystem {
                     .ok_or_else(|| Error::PathNotValid(to_path.into()))?
                     .to_owned();
                 let old_name = entry.name().clone();
+                //TODO: Remove parent() and navigate using paths
                 if let Some(parent) = entry.parent() {
                     _entries
                         .get_mut(parent)
@@ -797,17 +729,6 @@ impl fmt::Debug for FileSystem {
     }
 }
 
-// Split the path into it's components.
-fn into_components(path: &Path) -> Vec<OsString> {
-    path.components()
-        .filter_map(|c| match c {
-            Component::RootDir => Some("/".into()),
-            Component::Normal(path) => Some(path.into()),
-            _ => None,
-        })
-        .collect()
-}
-
 // Attach rules for all sub paths for a path
 fn append_rules(rules: &mut Rules, mut path: PathBuf) {
     rules.add_inclusion(
@@ -959,7 +880,6 @@ mod tests {
     // Simulates the `create_move` log rotation strategy
     #[tokio::test]
     async fn filesystem_rotate_create_move() {
-        let _ = env_logger::Builder::from_default_env().try_init();
         let temp_dir = tempdir().unwrap();
         let path = temp_dir.path();
 
@@ -994,159 +914,135 @@ mod tests {
     }
 
     // Simulates the `create_copy` log rotation strategy
-    #[test]
-    fn filesystem_rotate_create_copy() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
+    #[tokio::test]
+    async fn filesystem_rotate_create_copy() -> io::Result<()> {
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path().to_path_buf();
+        let fs = create_fs(&path);
 
-            let fs = Arc::new(Mutex::new(new_fs::<()>(path.clone(), None)));
+        let a = path.join("a");
+        File::create(&a)?;
+        take!(fs);
+        let entry_key = lookup!(fs, a);
+        assert_is_file!(fs, entry_key);
 
-            let a = path.join("a");
-            File::create(&a).unwrap();
+        // Copy and remove
+        let old = path.join("a.old");
+        copy(&a, &old)?;
+        remove_file(&a)?;
 
-            take_events!(fs, 1);
+        take!(fs);
+        let entry_key = lookup!(fs, a);
+        assert!(entry_key.is_none());
+        let entry_key = lookup!(fs, old);
+        assert_is_file!(fs, entry_key);
 
-            let entry = lookup_entry!(fs, a);
+        // Recreate original file back
+        File::create(&a)?;
+        take!(fs);
+        let entry_key = lookup!(fs, a);
+        assert_is_file!(fs, entry_key);
 
-            assert!(entry.is_some());
-            {
-                let _fs = fs.lock().expect("couldn't lock fs");
-                let _entries = &_fs.entries;
-                let _entries = _entries.borrow();
-                match _entries.get(entry.unwrap()).unwrap().deref() {
-                    Entry::File { .. } => {}
-                    _ => panic!("wrong entry type"),
-                };
-            }
-
-            let old = path.join("a.old");
-            copy(&a, &old).unwrap();
-            remove_file(&a).unwrap();
-
-            take_events!(fs, 2);
-
-            let entry = lookup_entry!(fs, a);
-            assert!(entry.is_none());
-
-            let entry = lookup_entry!(fs, old);
-
-            assert!(entry.is_some());
-            {
-                let _fs = fs.lock().expect("couldn't lock fs");
-                let _entries = &_fs.entries;
-                let _entries = _entries.borrow();
-                match _entries.get(entry.unwrap()).unwrap().deref() {
-                    Entry::File { .. } => {}
-                    _ => panic!("wrong entry type"),
-                };
-            }
-
-            File::create(&a).unwrap();
-
-            take_events!(fs, 1);
-
-            let entry = lookup_entry!(fs, a);
-            assert!(entry.is_some());
-            let _fs = fs.lock().expect("couldn't lock fs");
-            let _entries = &_fs.entries;
-            let _entries = _entries.borrow();
-            match _entries.get(entry.unwrap()).unwrap().deref() {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            };
-        });
+        Ok(())
     }
 
     // Creates a plain old dir
-    #[test]
-    fn filesystem_create_dir() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
+    #[tokio::test]
+    async fn filesystem_create_dir() {
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path().to_path_buf();
 
-            let fs = Arc::new(Mutex::new(new_fs::<()>(path.clone(), None)));
+        let fs = create_fs(&path);
+        take!(fs);
+        let entry_key = lookup!(fs, path);
+        assert!(entry_key.is_some());
 
-            take_events!(fs, 1);
-
-            assert!(lookup_entry!(fs, path).is_some());
-        });
+        let fs = fs.lock().expect("couldn't lock fs");
+        let entries = fs.entries.borrow();
+        assert!(matches!(
+            entries.get(entry_key.unwrap()).unwrap().deref(),
+            Entry::Dir { .. }
+        ));
     }
 
     /// Creates a dir w/ dots and a file after initialization
-    #[test]
-    fn filesystem_create_dir_after_init() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
+    #[tokio::test]
+    async fn filesystem_create_dir_after_init() -> io::Result<()> {
+        let tempdir = TempDir::new()?;
+        let path = tempdir.path().to_path_buf();
 
-            let file_system = Arc::new(Mutex::new(new_fs::<()>(path.clone(), None)));
+        let fs = create_fs(&path);
+        take!(fs);
 
-            take_events!(file_system, 1);
+        // Use a subdirectory with dots
+        let sub_dir = path.join("sub.dir");
+        create_dir(&sub_dir)?;
+        let file_path = sub_dir.join("insert.log");
+        File::create(&file_path)?;
 
-            // Use a subdirectory with dots
-            let sub_dir = path.join("sub.dir");
-            create_dir(&sub_dir).unwrap();
-            let file_path = sub_dir.join("insert.log");
-            File::create(&file_path).unwrap();
-
-            take_events!(file_system, 2);
-
-            assert!(lookup_entry!(file_system, &file_path).is_some());
-        });
+        take!(fs);
+        let entry_key = lookup!(fs, file_path);
+        assert_is_file!(fs, entry_key);
+        Ok(())
     }
 
     // Creates a plain old file
-    #[test]
-    fn filesystem_create_file() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
+    #[tokio::test]
+    async fn filesystem_create_file() -> io::Result<()> {
+        let tempdir = TempDir::new()?;
+        let path = tempdir.path().to_path_buf();
 
-            let fs = Arc::new(Mutex::new(new_fs::<()>(path.clone(), None)));
+        let fs = create_fs(&path);
+        let file_path = path.join("insert.log");
+        File::create(&file_path)?;
+        take!(fs);
 
-            File::create(path.join("insert.log")).unwrap();
-            take_events!(fs, 1);
-
-            assert!(lookup_entry!(fs, path.join("insert.log")).is_some());
-        });
+        let entry_key = lookup!(fs, file_path);
+        assert_is_file!(fs, entry_key);
+        Ok(())
     }
 
     // Creates a symlink
-    #[test]
-    fn filesystem_create_symlink() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
+    #[tokio::test]
+    async fn filesystem_create_symlink() -> io::Result<()> {
+        let _ = env_logger::Builder::from_default_env().try_init();
+        let tempdir = TempDir::new()?;
+        let path = tempdir.path().to_path_buf();
 
-            let fs = Arc::new(Mutex::new(new_fs::<()>(path.clone(), None)));
+        let fs = create_fs(&path);
 
-            let a = path.join("a");
-            let b = path.join("b");
-            create_dir(&a).unwrap();
-            symlink(&a, &b).unwrap();
+        let a = path.join("a");
+        let b = path.join("b");
+        create_dir(&a)?;
+        symlink(&a, &b)?;
 
-            take_events!(fs, 1);
+        take!(fs);
 
-            let entry = lookup_entry!(fs, a);
-            assert!(entry.is_some());
-            let entry2 = lookup_entry!(fs, b);
-            assert!(entry.is_some());
-            let _fs = fs.lock().expect("couldn't lock fs");
-            let _entries = &_fs.entries;
-            let _entries = _entries.borrow();
-            match _entries.get(entry.unwrap()).unwrap().deref() {
-                Entry::Dir { .. } => {}
-                _ => panic!("wrong entry type"),
-            };
+        let entry = lookup!(fs, a);
+        assert!(entry.is_some());
+        let entry2 = lookup!(fs, b);
+        assert!(entry.is_some());
+        let _fs = fs.lock().expect("couldn't lock fs");
+        let _entries = &_fs.entries;
+        let _entries = _entries.borrow();
+        match _entries.get(entry.unwrap()).unwrap().deref() {
+            Entry::Dir { .. } => {}
+            _ => panic!("wrong entry type"),
+        };
 
-            match _entries.get(entry2.unwrap()).unwrap().deref() {
-                Entry::Symlink { link, .. } => {
-                    assert_eq!(*link, a);
-                }
-                _ => panic!("wrong entry type"),
-            };
-        });
+        match _entries.get(entry2.unwrap()).unwrap().deref() {
+            Entry::Symlink { link, .. } => {
+                assert_eq!(*link, a);
+            }
+            Entry::Dir { .. } => {
+                panic!("is dir");
+            }
+            Entry::File { .. } => {
+                panic!("is dir");
+            }
+        };
+
+        Ok(())
     }
 
     // Creates a hardlink
@@ -1724,54 +1620,6 @@ mod tests {
 
             let entry = lookup_entry!(fs, file_path);
             assert!(entry.is_some());
-        });
-    }
-
-    #[test]
-    fn filesystem_resolve_valid_paths() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let test_dir_path = path.join("testdir");
-            let nested_dir_path = path.join("nested");
-            let local_symlink_path = path.join("local_symlink.log");
-            let remote_symlink_path = test_dir_path.join("remote_symlink.log");
-            let nested_symlink_path = nested_dir_path.join("nested_symlink.log");
-            let double_nested_symlink_path = nested_dir_path.join("double_nested_symlink.log");
-            let file_path = path.join("file.log");
-
-            File::create(file_path.clone()).unwrap();
-            create_dir(&test_dir_path).unwrap();
-            create_dir(&nested_dir_path).unwrap();
-            symlink(&file_path, &remote_symlink_path).unwrap();
-            symlink(&file_path, &local_symlink_path).unwrap();
-            symlink(&remote_symlink_path, &nested_symlink_path).unwrap();
-            symlink(&nested_symlink_path, &double_nested_symlink_path).unwrap();
-
-            let fs = Arc::new(Mutex::new(new_fs::<()>(path, None)));
-            let entry = lookup_entry!(fs, file_path).unwrap();
-
-            let _fs = fs.lock().expect("failed to lock fs");
-            let entries = _fs.entries.borrow();
-            let resolved_paths =
-                _fs.resolve_valid_paths(_fs.entries.borrow().get(entry).unwrap().deref(), &entries);
-
-            assert!(resolved_paths
-                .iter()
-                .any(|other| other.to_str() == local_symlink_path.to_str()));
-            assert!(resolved_paths
-                .iter()
-                .any(|other| other.to_str() == remote_symlink_path.to_str()));
-            assert!(resolved_paths
-                .iter()
-                .any(|other| other.to_str() == file_path.to_str()));
-            assert!(resolved_paths
-                .iter()
-                .any(|other| other.to_str() == nested_symlink_path.to_str()));
-            assert!(resolved_paths
-                .iter()
-                .any(|other| other.to_str() == double_nested_symlink_path.to_str()));
         });
     }
 }

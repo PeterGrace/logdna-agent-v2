@@ -129,7 +129,7 @@ impl Tailer {
         let entry_key = fs.lookup(target, &fs.entries.borrow())?;
         let entries = fs.entries.borrow();
         let entry = &entries.get(entry_key)?;
-        let path = fs.resolve_direct_path(entry, &fs.entries.borrow());
+        let path = entry.path();
         if let Entry::File { data, .. } = entry {
             let inode: FileId = { (&data.borrow().deref().get_inode().await).into() };
             Some((
@@ -208,9 +208,7 @@ impl Tailer {
                         );
 
                         let entries = &fs.entries.borrow();
-                        //TODO: Use entries.get(final_target)?.path() instead
-                        let path = fs
-                            .resolve_direct_path(entries.get(final_target)?, &fs.entries.borrow());
+                        let path = entries.get(final_target)?.path();
 
                         let (entry_key, offset) = Tailer::get_initial_offset(
                             &path,
@@ -264,25 +262,22 @@ impl Tailer {
                 let ret = {
                     let entries = fs.entries.borrow();
                     let mut entry = entries.get(entry_ptr)?;
-                    let paths = fs.resolve_valid_paths(&entry, &entries);
-                    if paths.is_empty() {
-                        None
-                    } else {
-                        if let Entry::Symlink { link, .. } = entry {
-                            if let Some(real_entry) = fs.lookup(link, &entries) {
-                                if let Some(r_entry) = entries.get(real_entry) {
-                                    entry = r_entry
-                                }
-                            } else {
-                                info!("can't wrap up deleted symlink - pointed to file / directory doesn't exist: {:?}", paths[0]);
-                            }
-                        }
+                    let path = entry.path().to_path_buf();
 
-                        if let Entry::File { data, .. } = entry {
-                            data.borrow_mut().deref_mut().tail(paths).await
+                    if let Entry::Symlink { link, .. } = entry {
+                        if let Some(real_entry) = fs.lookup(link, &entries) {
+                            if let Some(r_entry) = entries.get(real_entry) {
+                                entry = r_entry
+                            }
                         } else {
-                            None
+                            info!("can't wrap up deleted symlink - pointed to file / directory doesn't exist: {:?}", path);
                         }
+                    }
+
+                    if let Entry::File { data, .. } = entry {
+                        data.borrow_mut().deref_mut().tail(vec![path]).await
+                    } else {
+                        None
                     }
                 };
                 {
